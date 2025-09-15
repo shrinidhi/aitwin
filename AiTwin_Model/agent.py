@@ -287,7 +287,7 @@ Answer strictly from CONTEXT and CONVERSATION HISTORY only.
             return answer, metrics
         except Exception as e:
             error_message = f"An error occurred during the RAG process: {str(e)}"
-            print(f"❗ {error_message}")
+            print(f" {error_message}")
             metrics["total_latency"] = time.time() - start_total
             return "Sorry, an internal error occurred while processing your request.", metrics
 
