@@ -70,7 +70,7 @@ class RAGSystem:
             self.tokenizer = AutoTokenizer.from_pretrained(self.hf_model)
             self.model = AutoModel.from_pretrained(self.hf_model)
         except Exception as e:
-            print(f"❌ Failed to load HuggingFace models: {e}")
+            print(f"Failed to load HuggingFace models: {e}")
             raise RuntimeError("Model loading failed.")
         
         self.chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
@@ -115,7 +115,7 @@ class RAGSystem:
     def ingest_docs(self) -> JSONResponse:
         files = glob.glob(os.path.join(self.upload_dir, f"**/{self.doc_extension}"), recursive=True)
         if not files:
-            message = f"❌ No documents found in '{self.upload_dir}' with extension '{self.doc_extension}'."
+            message = f"No documents found in '{self.upload_dir}' with extension '{self.doc_extension}'."
             print(message)
             return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"message": message})
         
@@ -127,7 +127,7 @@ class RAGSystem:
         total_chunks = 0
         
         for doc_path in files:
-            print(f"✅ Ingesting knowledge base file: {doc_path}")
+            print(f"Ingesting knowledge base file: {doc_path}")
             
             file_extension = os.path.splitext(doc_path)[1].lower()
             full_text = ""
@@ -141,7 +141,7 @@ class RAGSystem:
                         full_text += page.get_text()
                     doc.close()
                 else:
-                    print(f"❌ Skipping unsupported file type: {file_extension} for {doc_path}")
+                    print(f" Skipping unsupported file type: {file_extension} for {doc_path}")
                     continue
                 
                 full_text = self._normalize_roman_numerals(full_text)
@@ -164,21 +164,21 @@ class RAGSystem:
                     ids=ids_to_add,
                     metadatas=metadatas_to_add
                 )
-                print(f"✅ Upserted {len(documents_to_add)} documents from {os.path.basename(doc_path)}.")
+                print(f" Upserted {len(documents_to_add)} documents from {os.path.basename(doc_path)}.")
                 total_chunks += len(documents_to_add)
 
             except Exception as e:
-                print(f"❌ Failed to process document {doc_path}: {e}")
+                print(f" Failed to process document {doc_path}: {e}")
         
         end = time.time()
         
-        message = f"✅ Ingestion & indexing of {total_chunks} docs completed in {end-start:.2f} seconds."
+        message = f" Ingestion & indexing of {total_chunks} docs completed in {end-start:.2f} seconds."
         print(message)
         return JSONResponse(status_code=status.HTTP_200_OK, content={"message": message})
 
     def retrieve_and_answer(self, messages: List[TextMessage]) -> Tuple[str, dict]:
         start_total = time.time()
-        print(f"\n--- 🤖 RAG pipeline executing with conversation history. ---")
+        print(f"\n---  RAG pipeline executing with conversation history. ---")
         
         latest_query = messages[-1].content
         
@@ -231,7 +231,7 @@ Standalone Question:"""
             standalone_query = rephrased_response.choices[0].message.content.strip()
             metrics["rephrase_latency"] = end_rephrase - start_rephrase
             metrics["rephrase_tokens"] = rephrased_response.usage.total_tokens
-            print(f"🔄 Rephrased standalone query: '{standalone_query}'")
+            print(f" Rephrased standalone query: '{standalone_query}'")
             
             # Step 2: Retrieval using the standalone query
             start_retrieval = time.time()
@@ -283,7 +283,7 @@ Answer strictly from CONTEXT and CONVERSATION HISTORY only.
             metrics["generation_tokens"] = response.usage.total_tokens
             metrics["total_latency"] = end_generation - start_total
             
-            print(f"--- ✅ RAG system generated a contextual answer. ---")
+            print(f"---  RAG system generated a contextual answer. ---")
             return answer, metrics
         except Exception as e:
             error_message = f"An error occurred during the RAG process: {str(e)}"
