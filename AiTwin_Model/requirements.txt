@@ -11,3 +11,10 @@ fastapi
 uvicorn[standard] 
 PyYAML
 aiofiles
+
+fitz
+frontend
+tools
+transformers
+torch
+autogen
