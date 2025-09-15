@@ -1,8 +1,3 @@
-# create folder temp/chromadb/ add .txt files inside this folder
-
-
-
-
 import json
 import os
 import time
@@ -59,8 +54,9 @@ async def _record_metrics(data: dict):
 
 # --- RAG PIPELINE CONFIGURATION ---
 class RAGSystem:
-    def __init__(self, collection_name: str, upload_dir: str, doc_extension: str = "*.{txt,pdf}", model_name: str = "sentence-transformers/all-MiniLM-L6-v2", batch_size: int = 50):
+    def __init__(self, collection_name: str, history_collection_name: str, upload_dir: str, doc_extension: str = "*.{txt,pdf}", model_name: str = "sentence-transformers/all-MiniLM-L6-v2", batch_size: int = 50):
         self.collection_name = collection_name
+        self.history_collection_name = history_collection_name
         self.upload_dir = upload_dir
         self.doc_extension = doc_extension
         self.batch_size = batch_size
@@ -80,6 +76,13 @@ class RAGSystem:
         except Exception:
             self.collection = self.chroma_client.create_collection(name=self.collection_name)
             print(f"Collection '{self.collection_name}' created.")
+            
+        # New collection for chat history
+        try:
+            self.history_collection = self.chroma_client.get_or_create_collection(name=self.history_collection_name)
+            print(f"History collection '{self.history_collection_name}' found or created.")
+        except Exception as e:
+            print(f"Failed to get/create history collection: {e}")
 
     def embed_texts(self, texts: list[str]):
         inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
@@ -176,6 +179,28 @@ class RAGSystem:
         print(message)
         return JSONResponse(status_code=status.HTTP_200_OK, content={"message": message})
 
+    def ingest_message(self, message: TextMessage):
+        """Ingests a single message into the chat history collection."""
+        if not message.content:
+            return
+        
+        message_id = str(hashlib.sha256(message.content.encode('utf-8')).hexdigest())
+        metadata = {
+            "source": message.source,
+            "timestamp": time.time(),
+            "content_hash": message_id
+        }
+        
+        try:
+            self.history_collection.upsert(
+                documents=[message.content],
+                ids=[message_id],
+                metadatas=[metadata]
+            )
+            print(f"Ingested message from '{message.source}' into history collection.")
+        except Exception as e:
+            print(f"Failed to ingest message into history collection: {e}")
+
     def retrieve_and_answer(self, messages: List[TextMessage]) -> Tuple[str, dict]:
         start_total = time.time()
         print(f"\n---  RAG pipeline executing with conversation history. ---")
@@ -235,30 +260,40 @@ Standalone Question:"""
             
             # Step 2: Retrieval using the standalone query
             start_retrieval = time.time()
+            # Retrieve from knowledge base and chat history
             query_emb = self.embed_texts([standalone_query])[0]
-            results = self.collection.query(query_embeddings=[query_emb], n_results=10)
+            
+            # Query the knowledge base
+            kb_results = self.collection.query(query_embeddings=[query_emb], n_results=5)
+            # Query the chat history
+            history_results = self.history_collection.query(query_embeddings=[query_emb], n_results=5)
+            
             end_retrieval = time.time()
             
-            docs = results.get("documents", [[]])[0]
-            context = "\n".join(docs)
+            # Combine documents from both collections
+            kb_docs = kb_results.get("documents", [[]])[0]
+            history_docs = history_results.get("documents", [[]])[0]
+            combined_docs = kb_docs + history_docs
+            context = "\n".join(combined_docs)
+            
             metrics["retrieval_latency"] = end_retrieval - start_retrieval
-            metrics["retrieved_docs"] = len(docs)
+            metrics["retrieved_docs"] = len(combined_docs)
             
             if not context.strip():
                 metrics["total_latency"] = time.time() - start_total
-                return "Sorry, I could not find any relevant information on that topic in the knowledge base.", metrics
+                return "Sorry, I could not find any relevant information on that topic in the knowledge base or chat history.", metrics
             
             # Step 3: Generation using the retrieved context
             start_generation = time.time()
             prompt = f"""You are a STRICT knowledge agent.  
 
-            Your job is ONLY to answer questions using the provided CONTEXT (retrieved documents) and the CONVERSATION HISTORY.  
-            - Do NOT use your own brain, prior knowledge, or outside assumptions.  
-            - Do NOT generate facts, explanations, or background information unless it is explicitly found in the CONTEXT or CONVERSATION HISTORY.  
-            - If the answer cannot be found directly in the CONTEXT or CONVERSATION HISTORY, you MUST reply with exactly:  
-            "Sorry, I could not find relevant information in the knowledge base."
+Your job is ONLY to answer questions using the provided CONTEXT (retrieved documents) and the CONVERSATION HISTORY.  
+- Do NOT use your own brain, prior knowledge, or outside assumptions.  
+- Do NOT generate facts, explanations, or background information unless it is explicitly found in the CONTEXT or CONVERSATION HISTORY.  
+- If the answer cannot be found directly in the CONTEXT or CONVERSATION HISTORY, you MUST reply with exactly:  
+"Sorry, I could not find relevant information in the knowledge base."
 
-CONTEXT (retrieved documents):
+CONTEXT (retrieved documents from knowledge base AND chat history):
 {context}
 
 CONVERSATION HISTORY:
@@ -311,7 +346,7 @@ async def get_agent(history: list[dict[str, Any]], rag_system: RAGSystem) -> RAG
     return agent
 
 # Initialize RAGSystem globally
-rag_system = RAGSystem(collection_name="generalized_collection", upload_dir=UPLOAD_DIR, doc_extension="*.*", batch_size=100)
+rag_system = RAGSystem(collection_name="generalized_collection", history_collection_name="chat_history_collection", upload_dir=UPLOAD_DIR, doc_extension="*.*", batch_size=100)
 
 # --- FASTAPI ENDPOINTS ---
 @app.get("/")
@@ -361,6 +396,9 @@ async def chat(request: TextMessage) -> TextMessage:
         if not isinstance(history_list, list):
             history_list = []
         
+        # Ingest the new user message into the history collection
+        rag_system.ingest_message(request)
+        
         history_list.append(request.model_dump())
         
         agent = await get_agent(history=history_list, rag_system=rag_system)
@@ -369,6 +407,9 @@ async def chat(request: TextMessage) -> TextMessage:
             messages=[TextMessage(**msg) for msg in history_list], 
             cancellation_token=CancellationToken()
         )
+        
+        # Ingest the new agent response into the history collection
+        rag_system.ingest_message(response)
         
         history_list.append(response.model_dump())
         
