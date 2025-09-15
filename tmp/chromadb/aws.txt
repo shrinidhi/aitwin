@@ -1,0 +1,514 @@
+# AWS Services Complete Knowledge Base
+
+## Complete AWS Services Catalog 2025
+
+### COMPUTE SERVICES
+
+#### Amazon EC2 (Elastic Compute Cloud)
+- **Purpose**: Virtual servers in the cloud
+- **Use Cases**: Web hosting, application hosting, high-performance computing
+- **Instance Types**: General Purpose (t3, m5), Compute Optimized (c5), Memory Optimized (r5, x1), Storage Optimized (i3), Accelerated Computing (p3, g4)
+- **Pricing Models**: On-Demand, Reserved Instances, Spot Instances, Dedicated Hosts
+- **Key Features**: Auto Scaling, Elastic IPs, Security Groups, Key Pairs
+- **Edge Cases**: Instance store data loss on stop/terminate, network performance varies by instance size, placement groups for cluster computing
+- **Best Practices**: Use IAM roles instead of access keys, implement proper security groups, monitor with CloudWatch
+- **Common Issues**: Instance launch failures due to capacity, network connectivity problems, storage optimization
+
+#### AWS Lambda
+- **Purpose**: Serverless compute service
+- **Use Cases**: Event-driven processing, microservices, real-time file processing
+- **Languages Supported**: Node.js, Python, Java, C#, Go, Ruby, PowerShell
+- **Limits**: 15-minute execution time, 10GB memory limit, 512MB-10GB temporary storage
+- **Edge Cases**: Cold start latency, concurrent execution limits, VPC networking complexity
+- **Best Practices**: Optimize package size, reuse execution context, use environment variables
+- **Common Issues**: Timeout errors, memory allocation, dependency packaging
+
+#### AWS Fargate
+- **Purpose**: Serverless container compute
+- **Use Cases**: Containerized applications without server management
+- **Integration**: Works with ECS and EKS
+- **Edge Cases**: Limited customization compared to EC2, networking complexity
+- **Best Practices**: Right-size containers, use ALB for load balancing
+
+#### AWS Batch
+- **Purpose**: Fully managed batch computing
+- **Use Cases**: Large-scale parallel workloads, scientific computing
+- **Components**: Job Definitions, Job Queues, Compute Environments
+- **Edge Cases**: Complex dependency management, cost optimization challenges
+
+#### Amazon Lightsail
+- **Purpose**: Simplified virtual private servers
+- **Use Cases**: Simple web applications, development environments
+- **Limitations**: Limited scalability, fewer advanced features
+- **Best Practices**: Use for simple workloads, consider migration path to EC2
+
+### STORAGE SERVICES
+
+#### Amazon S3 (Simple Storage Service)
+- **Purpose**: Object storage service
+- **Storage Classes**: 
+  - Standard: Frequently accessed data
+  - Standard-IA: Infrequently accessed data
+  - One Zone-IA: Lower-cost option for infrequently accessed data
+  - Glacier Instant Retrieval: Archive data with millisecond retrieval
+  - Glacier Flexible Retrieval: Archive data with retrieval in minutes to hours
+  - Glacier Deep Archive: Lowest-cost storage for long-term retention
+  - Intelligent-Tiering: Automatic cost optimization
+- **Features**: Versioning, Cross-Region Replication, Transfer Acceleration, Event Notifications
+- **Security**: Bucket policies, ACLs, server-side encryption, client-side encryption
+- **Edge Cases**: Eventual consistency issues (legacy), hot spotting with sequential naming
+- **Best Practices**: Use random prefixes, enable versioning, implement lifecycle policies
+- **Common Issues**: Permission errors, CORS configuration, performance optimization
+
+#### Amazon EBS (Elastic Block Store)
+- **Purpose**: Block storage for EC2 instances
+- **Volume Types**: 
+  - gp3: General Purpose SSD (latest generation)
+  - gp2: General Purpose SSD (previous generation)
+  - io2: Provisioned IOPS SSD (latest generation)
+  - io1: Provisioned IOPS SSD (previous generation)
+  - st1: Throughput Optimized HDD
+  - sc1: Cold HDD
+- **Features**: Snapshots, Encryption, Multi-Attach
+- **Edge Cases**: IOPS credits with gp2, attachment limitations
+- **Best Practices**: Regular snapshots, appropriate volume types, monitoring performance
+
+#### Amazon EFS (Elastic File System)
+- **Purpose**: Managed NFS file system
+- **Use Cases**: Content management, web serving, application data sharing
+- **Performance Modes**: General Purpose, Max I/O
+- **Throughput Modes**: Provisioned, Bursting
+- **Edge Cases**: Performance varies with file system size, POSIX compliance limitations
+
+#### Amazon FSx
+- **Types**: 
+  - FSx for Windows File Server: Fully managed Windows file systems
+  - FSx for Lustre: High-performance file system for compute-intensive workloads
+  - FSx for NetApp ONTAP: Fully managed shared storage
+  - FSx for OpenZFS: Fully managed OpenZFS file systems
+- **Use Cases**: Enterprise applications, high-performance computing, machine learning
+
+### DATABASE SERVICES
+
+#### Amazon RDS (Relational Database Service)
+- **Engines**: MySQL, PostgreSQL, MariaDB, Oracle, SQL Server, Amazon Aurora
+- **Features**: Automated backups, Multi-AZ deployments, Read Replicas, Parameter Groups
+- **Aurora Specifics**: MySQL and PostgreSQL compatible, serverless option, global database
+- **Edge Cases**: Connection limits, storage autoscaling, minor version upgrades
+- **Best Practices**: Use Multi-AZ for production, implement read replicas, monitor performance
+- **Common Issues**: Connection pooling, backup window planning, parameter optimization
+
+#### Amazon DynamoDB
+- **Purpose**: Fully managed NoSQL database
+- **Features**: On-demand and provisioned billing, Global Tables, DynamoDB Streams
+- **Capacity Modes**: On-demand (pay-per-request), Provisioned (predictable traffic)
+- **Edge Cases**: Hot partitions, eventually consistent reads, item size limits (400KB)
+- **Best Practices**: Design good partition keys, use sparse indexes, implement caching
+- **Common Issues**: Throttling, hot partition problems, cost optimization
+
+#### Amazon Redshift
+- **Purpose**: Data warehouse service
+- **Features**: Columnar storage, massively parallel processing, SQL interface
+- **Node Types**: Dense Compute (dc2), Dense Storage (ds2), RA3 (ra3)
+- **Edge Cases**: Vacuum operations, sort key selection, distribution key optimization
+- **Best Practices**: Choose appropriate sort and distribution keys, regular maintenance
+
+#### Amazon ElastiCache
+- **Engines**: Redis, Memcached
+- **Use Cases**: Caching, session storage, real-time analytics
+- **Redis Features**: Persistence, clustering, Multi-AZ
+- **Edge Cases**: Memory optimization, eviction policies, cluster scaling
+
+### NETWORKING AND CONTENT DELIVERY
+
+#### Amazon VPC (Virtual Private Cloud)
+- **Components**: Subnets, Route Tables, Internet Gateways, NAT Gateways, Security Groups, NACLs
+- **Features**: VPC Peering, Transit Gateway, VPC Endpoints
+- **CIDR Considerations**: Plan IP addressing, avoid overlapping ranges
+- **Edge Cases**: Route table conflicts, security group rule limits, NAT Gateway bandwidth
+- **Best Practices**: Use multiple AZs, implement proper security layers, monitor traffic
+
+#### Amazon CloudFront
+- **Purpose**: Content Delivery Network (CDN)
+- **Features**: Global edge locations, custom SSL certificates, Lambda@Edge, CloudFront Functions
+- **Cache Behaviors**: TTL settings, query string forwarding, header forwarding
+- **Edge Cases**: Cache invalidation costs, origin request behavior, geographic restrictions
+- **Best Practices**: Optimize cache hit ratios, use appropriate TTLs, implement security headers
+
+#### AWS Route 53
+- **Purpose**: DNS web service
+- **Features**: Domain registration, health checks, traffic routing policies
+- **Routing Policies**: Simple, Weighted, Latency-based, Failover, Geolocation, Geoproximity, Multivalue
+- **Edge Cases**: DNS propagation delays, health check configuration, subdomain delegation
+
+#### Elastic Load Balancing (ELB)
+- **Types**: 
+  - Application Load Balancer (ALB): Layer 7, HTTP/HTTPS
+  - Network Load Balancer (NLB): Layer 4, TCP/UDP
+  - Gateway Load Balancer (GWLB): Layer 3, IP packets
+  - Classic Load Balancer (CLB): Legacy, Layer 4 and 7
+- **Features**: Health checks, SSL termination, sticky sessions
+- **Edge Cases**: Cross-zone load balancing costs, target group health checks
+
+### SECURITY, IDENTITY, AND COMPLIANCE
+
+#### AWS IAM (Identity and Access Management)
+- **Components**: Users, Groups, Roles, Policies
+- **Policy Types**: AWS Managed, Customer Managed, Inline
+- **Features**: MFA, Access Keys, Temporary Credentials, Cross-Account Access
+- **Edge Cases**: Policy evaluation logic, resource-based vs identity-based policies
+- **Best Practices**: Principle of least privilege, use roles for applications, regular access reviews
+- **Common Issues**: Permission boundaries, policy conflicts, credential management
+
+#### AWS KMS (Key Management Service)
+- **Purpose**: Managed encryption key service
+- **Key Types**: Customer Managed Keys, AWS Managed Keys, AWS Owned Keys
+- **Features**: Key rotation, grants, key policies
+- **Edge Cases**: Key usage limits, cross-region key access, envelope encryption
+
+#### AWS Secrets Manager
+- **Purpose**: Manage secrets securely
+- **Features**: Automatic rotation, fine-grained access control, integration with RDS
+- **Edge Cases**: Rotation function failures, cross-region replication
+
+#### Amazon GuardDuty
+- **Purpose**: Threat detection service
+- **Features**: Machine learning-based threat detection, integration with Security Hub
+- **Edge Cases**: False positives, custom threat intelligence, multi-account management
+
+#### AWS Security Hub
+- **Purpose**: Centralized security findings management
+- **Features**: Compliance dashboards, finding aggregation, custom insights
+- **Edge Cases**: Finding deduplication, cross-region aggregation
+
+### ANALYTICS
+
+#### Amazon Kinesis
+- **Services**: 
+  - Kinesis Data Streams: Real-time data streaming
+  - Kinesis Data Firehose: Data delivery to destinations
+  - Kinesis Data Analytics: Real-time analytics on streaming data
+  - Kinesis Video Streams: Video streaming and analytics
+- **Edge Cases**: Shard capacity limits, hot shard problems, producer/consumer scaling
+
+#### Amazon EMR (Elastic MapReduce)
+- **Purpose**: Big data processing using Hadoop ecosystem
+- **Frameworks**: Spark, Hadoop, HBase, Presto, Flink
+- **Edge Cases**: Cluster sizing, spot instance interruptions, data locality
+
+#### Amazon Athena
+- **Purpose**: Interactive query service for S3 data
+- **Features**: Serverless, SQL interface, integration with Glue Data Catalog
+- **Edge Cases**: Query performance optimization, partitioning strategies, data format selection
+
+#### Amazon QuickSight
+- **Purpose**: Business intelligence service
+- **Features**: Interactive dashboards, machine learning insights, embedded analytics
+- **Edge Cases**: Data source connectivity, user management, cost optimization
+
+### MACHINE LEARNING
+
+#### Amazon SageMaker
+- **Purpose**: Fully managed machine learning platform
+- **Components**: Notebooks, Training Jobs, Endpoints, Pipelines
+- **Features**: Built-in algorithms, custom containers, automatic scaling
+- **Edge Cases**: Training job resource limits, endpoint cold starts, data preprocessing
+
+#### Amazon Comprehend
+- **Purpose**: Natural language processing service
+- **Features**: Sentiment analysis, entity recognition, topic modeling
+- **Edge Cases**: Language support limitations, custom entity recognition
+
+#### Amazon Rekognition
+- **Purpose**: Image and video analysis
+- **Features**: Object detection, facial analysis, text extraction
+- **Edge Cases**: Accuracy variations, content moderation policies
+
+### APPLICATION INTEGRATION
+
+#### Amazon SQS (Simple Queue Service)
+- **Queue Types**: Standard (at-least-once delivery), FIFO (exactly-once processing)
+- **Features**: Dead letter queues, message retention, visibility timeout
+- **Edge Cases**: Message ordering in standard queues, duplicate processing
+- **Best Practices**: Implement idempotent consumers, use appropriate visibility timeout
+
+#### Amazon SNS (Simple Notification Service)
+- **Purpose**: Pub/sub messaging service
+- **Features**: Multiple protocol support, message filtering, mobile push notifications
+- **Edge Cases**: Message delivery retries, large message handling
+
+#### AWS Step Functions
+- **Purpose**: Serverless workflow orchestration
+- **Workflow Types**: Standard (long-running), Express (high-volume, short-duration)
+- **Edge Cases**: State machine complexity limits, error handling strategies
+
+### DEVELOPER TOOLS
+
+#### AWS CodeCommit
+- **Purpose**: Fully managed Git repositories
+- **Features**: Encryption at rest and in transit, IAM integration
+- **Edge Cases**: Repository size limits, concurrent user limits
+
+#### AWS CodeBuild
+- **Purpose**: Fully managed build service
+- **Features**: Multiple runtime environments, custom build environments
+- **Edge Cases**: Build timeouts, artifact handling, concurrent build limits
+
+#### AWS CodeDeploy
+- **Purpose**: Automated application deployment
+- **Deployment Types**: In-place, Blue/green
+- **Edge Cases**: Rollback strategies, deployment configuration optimization
+
+#### AWS CodePipeline
+- **Purpose**: Continuous integration and delivery service
+- **Features**: Visual workflow, third-party tool integration
+- **Edge Cases**: Pipeline execution concurrency, artifact store management
+
+### MANAGEMENT AND GOVERNANCE
+
+#### AWS CloudFormation
+- **Purpose**: Infrastructure as Code service
+- **Features**: Stack management, change sets, drift detection
+- **Edge Cases**: Stack update failures, circular dependencies, resource limits
+- **Best Practices**: Use nested stacks, implement proper rollback strategies
+
+#### AWS Config
+- **Purpose**: Configuration compliance monitoring
+- **Features**: Configuration snapshots, compliance rules, remediation actions
+- **Edge Cases**: Resource recording scope, rule evaluation frequency
+
+#### AWS CloudTrail
+- **Purpose**: API call logging and monitoring
+- **Features**: Event history, insights, organization trails
+- **Edge Cases**: Log file delivery delays, event filtering, storage costs
+
+#### AWS CloudWatch
+- **Purpose**: Monitoring and observability
+- **Features**: Metrics, logs, alarms, dashboards, insights
+- **Components**: CloudWatch Metrics, CloudWatch Logs, CloudWatch Events/EventBridge
+- **Edge Cases**: Metric resolution limits, log retention costs, alarm state changes
+
+### MIGRATION AND TRANSFER
+
+#### AWS Database Migration Service (DMS)
+- **Purpose**: Database migration service
+- **Features**: Homogeneous and heterogeneous migrations, ongoing replication
+- **Edge Cases**: Schema conversion complexity, replication lag
+
+#### AWS Server Migration Service (SMS)
+- **Purpose**: Server migration to AWS
+- **Features**: Incremental replication, automated AMI creation
+- **Edge Cases**: Large VM migrations, network bandwidth requirements
+
+#### AWS DataSync
+- **Purpose**: Data transfer service
+- **Features**: One-time or scheduled transfers, bandwidth throttling
+- **Edge Cases**: Large dataset transfers, network optimization
+
+### EDGE COMPUTING
+
+#### AWS Lambda@Edge
+- **Purpose**: Run code at CloudFront edge locations
+- **Use Cases**: Request/response modification, A/B testing, authentication
+- **Limitations**: Runtime restrictions, cold start latency
+- **Edge Cases**: Function execution limits, regional deployment delays
+
+#### CloudFront Functions
+- **Purpose**: Lightweight functions at edge locations
+- **Use Cases**: Simple request/response modifications, redirects
+- **Limitations**: JavaScript runtime only, execution time limits
+
+#### AWS IoT Greengrass
+- **Purpose**: Edge computing for IoT devices
+- **Features**: Local compute, messaging, data caching
+- **Edge Cases**: Device connectivity issues, local storage limitations
+
+### CONTAINERS
+
+#### Amazon ECS (Elastic Container Service)
+- **Purpose**: Container orchestration service
+- **Launch Types**: EC2, Fargate
+- **Features**: Service discovery, load balancing, auto scaling
+- **Edge Cases**: Task placement strategies, service mesh integration
+
+#### Amazon EKS (Elastic Kubernetes Service)
+- **Purpose**: Managed Kubernetes service
+- **Features**: Kubernetes API compatibility, add-ons, node groups
+- **Edge Cases**: Cluster upgrades, networking complexity, storage integration
+
+#### Amazon ECR (Elastic Container Registry)
+- **Purpose**: Container image registry
+- **Features**: Image scanning, lifecycle policies, replication
+- **Edge Cases**: Image layer caching, cross-region replication
+
+### COST OPTIMIZATION
+
+#### AWS Cost Explorer
+- **Purpose**: Cost analysis and forecasting
+- **Features**: Cost and usage reports, recommendations, budgets
+- **Edge Cases**: Data granularity limits, forecasting accuracy
+
+#### AWS Budgets
+- **Purpose**: Cost and usage budgeting
+- **Features**: Cost budgets, usage budgets, RI/SP budgets
+- **Edge Cases**: Budget alert delays, threshold configuration
+
+#### AWS Trusted Advisor
+- **Purpose**: Best practice recommendations
+- **Categories**: Cost optimization, security, fault tolerance, performance, service limits
+- **Edge Cases**: Check frequency, support plan requirements
+
+### EDGE CASES AND TROUBLESHOOTING
+
+#### Common AWS Edge Cases
+
+1. **EC2 Instance Connectivity Issues**
+   - Security group misconfiguration
+   - Network ACL blocking traffic
+   - Route table issues
+   - Instance status check failures
+   - SSH key problems
+
+2. **S3 Performance Issues**
+   - Hot spotting with sequential naming
+   - Request rate too high for partition
+   - Transfer acceleration not enabled
+   - CloudFront not configured properly
+
+3. **RDS Connection Problems**
+   - Connection limit exceeded
+   - Security group misconfiguration
+   - Parameter group settings
+   - Multi-AZ failover issues
+
+4. **Lambda Function Errors**
+   - Cold start latency
+   - Memory/timeout limitations
+   - VPC networking delays
+   - Concurrent execution limits
+   - Package size too large
+
+5. **CloudFormation Stack Issues**
+   - Circular dependencies
+   - Resource limit exceeded
+   - Rollback failures
+   - Permission issues
+   - Parameter validation errors
+
+6. **DynamoDB Performance Issues**
+   - Hot partition problems
+   - Throttling due to capacity
+   - GSI over-provisioning
+   - Large item sizes
+
+7. **VPC Networking Problems**
+   - Route table misconfigurations
+   - NAT Gateway bandwidth limits
+   - VPC endpoint policy issues
+   - Peering connection problems
+
+#### Troubleshooting Best Practices
+
+1. **Monitoring and Logging**
+   - Enable CloudTrail for API logging
+   - Use CloudWatch for metrics and alarms
+   - Implement structured logging
+   - Set up proper dashboards
+
+2. **Security Troubleshooting**
+   - Check IAM policies and roles
+   - Verify security group rules
+   - Review resource-based policies
+   - Validate SSL/TLS certificates
+
+3. **Performance Optimization**
+   - Monitor key metrics
+   - Use appropriate instance types
+   - Implement caching strategies
+   - Optimize database queries
+
+4. **Cost Management**
+   - Regular cost reviews
+   - Implement tagging strategies
+   - Use cost allocation reports
+   - Monitor unused resources
+
+### AWS SERVICE LIMITS AND QUOTAS
+
+#### EC2 Limits
+- On-Demand instances per region: Varies by instance type
+- Spot instances: No limit
+- EBS volumes per instance: Varies by instance type
+- Security groups per instance: 5 (default)
+
+#### S3 Limits
+- Bucket naming: Globally unique
+- Object size: 5TB maximum
+- Multipart upload: 10,000 parts maximum
+- Request rate: 3,500 PUT/COPY/POST/DELETE, 5,500 GET/HEAD per prefix
+
+#### RDS Limits
+- DB instances per region: 40 (default)
+- Read replicas per source: 5 for most engines
+- Automated backup retention: 0-35 days
+- Manual snapshot retention: No limit
+
+#### Lambda Limits
+- Execution time: 15 minutes maximum
+- Memory: 128MB to 10,240MB
+- Temporary storage: 512MB to 10,240MB
+- Concurrent executions: 1,000 (default)
+
+#### DynamoDB Limits
+- Item size: 400KB maximum
+- Partition key length: 2048 bytes maximum
+- Sort key length: 1024 bytes maximum
+- Global secondary indexes: 20 per table
+
+### SECURITY BEST PRACTICES
+
+1. **Identity and Access Management**
+   - Use IAM roles instead of access keys
+   - Implement least privilege principle
+   - Enable MFA for sensitive operations
+   - Regularly rotate credentials
+
+2. **Network Security**
+   - Use VPCs for network isolation
+   - Implement security groups and NACLs
+   - Enable VPC Flow Logs
+   - Use AWS PrivateLink for service connections
+
+3. **Data Protection**
+   - Encrypt data at rest and in transit
+   - Use AWS KMS for key management
+   - Implement proper backup strategies
+   - Enable versioning where applicable
+
+4. **Monitoring and Compliance**
+   - Enable CloudTrail for all regions
+   - Use AWS Config for compliance monitoring
+   - Implement GuardDuty for threat detection
+   - Regular security assessments
+
+### DISASTER RECOVERY AND HIGH AVAILABILITY
+
+1. **Multi-AZ Deployments**
+   - Use multiple Availability Zones
+   - Implement load balancing
+   - Design for failure scenarios
+   - Test failover procedures
+
+2. **Backup Strategies**
+   - Automated backup schedules
+   - Cross-region backup replication
+   - Point-in-time recovery
+   - Backup testing procedures
+
+3. **Recovery Planning**
+   - Define RTO and RPO requirements
+   - Document recovery procedures
+   - Regular disaster recovery testing
+   - Staff training on procedures
+
+This comprehensive knowledge base covers all major AWS services, their use cases, limitations, edge cases, best practices, and troubleshooting approaches. It serves as a complete reference for understanding and working with AWS services in 2025.
