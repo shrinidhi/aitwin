@@ -15,7 +15,7 @@ import aiofiles
 from autogen import ConversableAgent
 from autogen_agentchat.messages import TextMessage
 from autogen_core import CancellationToken
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -389,42 +389,65 @@ async def get_metrics():
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An error occurred: {str(e)}")
 
-@app.post("/chat", response_model=TextMessage)
-async def chat(request: TextMessage) -> TextMessage:
+# --- WEBSOCKET ENDPOINT ---
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    history_list = []
+    
     try:
+        # Load history at the start of the connection
         history_list = await get_history()
         if not isinstance(history_list, list):
             history_list = []
-        
-        # Ingest the new user message into the history collection
-        rag_system.ingest_message(request)
-        
-        history_list.append(request.model_dump())
-        
-        agent = await get_agent(history=history_list, rag_system=rag_system)
-        
-        response, metrics = await agent.on_messages(
-            messages=[TextMessage(**msg) for msg in history_list], 
-            cancellation_token=CancellationToken()
-        )
-        
-        # Ingest the new agent response into the history collection
-        rag_system.ingest_message(response)
-        
-        history_list.append(response.model_dump())
-        
-        await _record_metrics(metrics)
-        
-        async with aiofiles.open(HISTORY_PATH, "w") as file:
-            await file.write(json.dumps(history_list, indent=2, default=str))
+
+        while True:
+            # Receive message from the client
+            data = await websocket.receive_text()
+            request_data = json.loads(data)
+            request = TextMessage(**request_data)
+
+            # Ingest the new user message into the history collection
+            rag_system.ingest_message(request)
             
-        assert isinstance(response, TextMessage)
-        return response
+            history_list.append(request.model_dump())
+            
+            agent = await get_agent(history=history_list, rag_system=rag_system)
+            
+            response, metrics = await agent.on_messages(
+                messages=[TextMessage(**msg) for msg in history_list], 
+                cancellation_token=CancellationToken()
+            )
+            
+            def safe_model_dump(obj):
+               return json.loads(json.dumps(obj, default=str))
+            
+            # Ingest the new agent response into the history collection
+            rag_system.ingest_message(response)
+            
+            history_list.append(response.model_dump())
+            
+            await _record_metrics(metrics)
+            
+            # --- FIX APPLIED HERE ---
+            # The original code's `json.dumps` call needs to handle non-serializable objects.
+            # The `default=str` argument handles datetime and other types by converting them to strings.
+            async with aiofiles.open(HISTORY_PATH, "w") as file:
+                await file.write(json.dumps(history_list, indent=2, default=str))
+                
+            assert isinstance(response, TextMessage)
+            
+            # Send the response back to the client
+            await websocket.send_json(safe_model_dump(response.model_dump()))
+
+
+    except WebSocketDisconnect:
+        print("Client disconnected.")
     except Exception as e:
-        print(f"An unexpected error occurred in the chat endpoint: {e}")
+        print(f"An unexpected error occurred in the WebSocket endpoint: {e}")
         error_message = {
             "type": "error",
             "content": "An internal server error occurred.",
             "source": "system"
         }
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_message)
+        await websocket.send_json(error_message)
