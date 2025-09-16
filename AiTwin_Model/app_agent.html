@@ -137,6 +137,13 @@
         #ingest-btn:hover {
             background-color: #218838;
         }
+
+        #connection-status {
+            font-size: 0.8em;
+            color: #777;
+            text-align: right;
+            margin-top: 5px;
+        }
     </style>
 </head>
 
@@ -148,64 +155,97 @@
         <div id="messages"></div>
         <div id="input-container">
             <input type="text" id="message-input" placeholder="Type a message...">
-            <button onclick="sendMessage()">Send</button>
+            <button id="send-btn" onclick="sendMessage()">Send</button>
         </div>
+        <div id="connection-status">Connecting...</div>
     </div>
 
     <script>
-        document.getElementById('message-input').addEventListener('keydown', function (event) {
+        const messageInput = document.getElementById('message-input');
+        const sendButton = document.getElementById('send-btn');
+        const ingestButton = document.getElementById('ingest-btn');
+        const statusElement = document.getElementById('connection-status');
+        const serverUrl = 'ws://localhost:8001/ws';
+        let ws;
+
+        function connectWebSocket() {
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+                console.log("WebSocket is already connected or connecting.");
+                return;
+            }
+
+            ws = new WebSocket(serverUrl);
+
+            ws.onopen = function () {
+                console.log("WebSocket connection established.");
+                statusElement.textContent = 'Connected';
+                statusElement.style.color = '#28a745';
+                loadHistory(); // Load history after connection is open
+            };
+
+            ws.onmessage = function (event) {
+                const data = JSON.parse(event.data);
+                if (data.type === 'error') {
+                    displayMessage(data.content, 'error');
+                } else {
+                    displayMessage(data.content, data.source);
+                }
+                enableControls();
+            };
+
+            ws.onclose = function (event) {
+                console.log("WebSocket connection closed:", event.code, event.reason);
+                statusElement.textContent = 'Disconnected';
+                statusElement.style.color = '#dc3545';
+                displayMessage("Connection to the server was lost. Please refresh to reconnect.", 'system');
+                disableControls();
+            };
+
+            ws.onerror = function (error) {
+                console.error("WebSocket error:", error);
+                statusElement.textContent = 'Error';
+                statusElement.style.color = '#dc3545';
+                displayMessage("An error occurred with the WebSocket connection.", 'system');
+                disableControls();
+            };
+        }
+
+        function disableControls() {
+            messageInput.disabled = true;
+            sendButton.disabled = true;
+            ingestButton.disabled = true;
+        }
+
+        function enableControls() {
+            messageInput.disabled = false;
+            sendButton.disabled = false;
+            ingestButton.disabled = false;
+            messageInput.focus();
+        }
+
+        messageInput.addEventListener('keydown', function (event) {
             if (event.key === 'Enter') {
                 sendMessage();
             }
         });
 
         async function sendMessage() {
-            const input = document.getElementById('message-input');
-            const button = document.querySelector('#input-container button');
-            const message = input.value;
-            if (!message) return;
+            const message = messageInput.value.trim();
+            if (!message || ws.readyState !== WebSocket.OPEN) return;
 
             // Display user message
             displayMessage(message, 'user');
 
-            // Clear input and disable controls
-            input.value = '';
-            input.disabled = true;
-            button.disabled = true;
-            document.getElementById('ingest-btn').disabled = true;
+            // Clear input and disable controls while waiting for a response
+            messageInput.value = '';
+            disableControls();
 
-            try {
-                const response = await fetch('http://localhost:8001/chat', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ content: message, source: 'user' })
-                });
-
-                const data = await response.json();
-                if (!response.ok) {
-                    // Handle error response
-                    const errorContent = (data.detail && data.detail.content) || (data.detail || 'Unknown error');
-                    displayMessage('Error: ' + errorContent, 'error');
-                } else {
-                    displayMessage(data.content, 'assistant');
-                }
-            } catch (error) {
-                console.error('Error:', error);
-                displayMessage('Error: Could not reach the server.', 'error');
-            } finally {
-                // Re-enable controls
-                input.disabled = false;
-                button.disabled = false;
-                document.getElementById('ingest-btn').disabled = false;
-                input.focus();
-            }
+            const messageObject = { content: message, source: 'user' };
+            ws.send(JSON.stringify(messageObject));
         }
 
         async function ingestDocuments() {
-            const ingestBtn = document.getElementById('ingest-btn');
-            ingestBtn.disabled = true;
+            ingestButton.disabled = true;
             displayMessage('Ingestion started. Please wait...', 'system');
 
             try {
@@ -226,7 +266,7 @@
                 console.error('Ingestion error:', error);
                 displayMessage('Ingestion failed: Could not reach the server.', 'error');
             } finally {
-                ingestBtn.disabled = false;
+                ingestButton.disabled = false;
             }
         }
 
@@ -259,8 +299,10 @@
             }
         }
 
-        // Load chat history when the page loads
-        window.onload = loadHistory;
+        // Connect to WebSocket and load history on page load
+        window.onload = function () {
+            connectWebSocket();
+        };
     </script>
 </body>
 
