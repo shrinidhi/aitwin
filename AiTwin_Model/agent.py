@@ -20,6 +20,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+
+# ---- OpenTelemetry ----
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+trace.set_tracer_provider(TracerProvider())
+tracer = trace.get_tracer(__name__)
+
+
+otlp_exporter = OTLPSpanExporter(endpoint="http://localhost:4318/v1/traces")
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
+
 # --- FASTAPI SETUP ---
 app = FastAPI()
 app.add_middleware(
@@ -32,7 +46,8 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="."), name="static")
 
 # Use environment variables for sensitive or frequently changed configs
-HISTORY_PATH = os.environ.get("HISTORY_PATH", "agent_history.json")
+HISTORY_DIR = os.environ.get("HISTORY_DIR", "./history_files")
+os.makedirs(HISTORY_DIR, exist_ok=True)
 METRICS_PATH = "metrics.json"
 CHROMA_DB_PATH = os.environ.get("CHROMA_DB_PATH", "./chroma_db")
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./tmp/chromadb")
@@ -179,16 +194,16 @@ class RAGSystem:
         print(message)
         return JSONResponse(status_code=status.HTTP_200_OK, content={"message": message})
 
-    def ingest_message(self, message: TextMessage):
-        """Ingests a single message into the chat history collection."""
+    def ingest_message(self, message: TextMessage, user_id: str):
+        """Ingests a single message into the chat history collection with user metadata."""
         if not message.content:
             return
         
-        message_id = str(hashlib.sha256(message.content.encode('utf-8')).hexdigest())
+        message_id = str(hashlib.sha256(f"{user_id}_{message.content}".encode('utf-8')).hexdigest())
         metadata = {
             "source": message.source,
             "timestamp": time.time(),
-            "content_hash": message_id
+            "user_id": user_id
         }
         
         try:
@@ -197,13 +212,13 @@ class RAGSystem:
                 ids=[message_id],
                 metadatas=[metadata]
             )
-            print(f"Ingested message from '{message.source}' into history collection.")
+            print(f"Ingested message from '{message.source}' for user '{user_id}' into history collection.")
         except Exception as e:
-            print(f"Failed to ingest message into history collection: {e}")
+            print(f"Failed to ingest message into history collection for user '{user_id}': {e}")
 
-    def retrieve_and_answer(self, messages: List[TextMessage]) -> Tuple[str, dict]:
+    def retrieve_and_answer(self, messages: List[TextMessage], user_id: str) -> Tuple[str, dict]:
         start_total = time.time()
-        print(f"\n---  RAG pipeline executing with conversation history. ---")
+        print(f"\n--- RAG pipeline executing for user '{user_id}' with conversation history. ---")
         
         latest_query = messages[-1].content
         
@@ -229,13 +244,13 @@ class RAGSystem:
             start_rephrase = time.time()
             rephrase_prompt = f"""You are a STRICT rephrasing agent.
 
-Your ONLY task is to take the given conversation history and the follow-up question,  
-and restate the follow-up question as a clear standalone question.  
+Your ONLY task is to take the given conversation history and the follow-up question, 
+and restate the follow-up question as a clear standalone question. 
 
 Rules:
-- Use ONLY the information from the CONVERSATION HISTORY and the FOLLOW-UP QUESTION.  
-- Do NOT add, assume, or invent any new details.  
-- If the follow-up question is already standalone, return it unchanged.  
+- Use ONLY the information from the CONVERSATION HISTORY and the FOLLOW-UP QUESTION. 
+- Do NOT add, assume, or invent any new details. 
+- If the follow-up question is already standalone, return it unchanged. 
 
 CONVERSATION HISTORY:
 {history}
@@ -245,7 +260,6 @@ FOLLOW-UP QUESTION:
 
 Standalone Question:"""
 
-            
             rephrased_response = client.chat.completions.create(
                 model="mistralai/mistral-7b-instruct-v0.3",
                 messages=[{"role": "user", "content": rephrase_prompt}],
@@ -260,13 +274,16 @@ Standalone Question:"""
             
             # Step 2: Retrieval using the standalone query
             start_retrieval = time.time()
-            # Retrieve from knowledge base and chat history
             query_emb = self.embed_texts([standalone_query])[0]
             
-            # Query the knowledge base
+            # Query the knowledge base (no user filter needed)
             kb_results = self.collection.query(query_embeddings=[query_emb], n_results=5)
-            # Query the chat history
-            history_results = self.history_collection.query(query_embeddings=[query_emb], n_results=5)
+            # Query the chat history, filtering by user_id
+            history_results = self.history_collection.query(
+                query_embeddings=[query_emb],
+                n_results=5,
+                where={"user_id": user_id}
+            )
             
             end_retrieval = time.time()
             
@@ -281,16 +298,16 @@ Standalone Question:"""
             
             if not context.strip():
                 metrics["total_latency"] = time.time() - start_total
-                return "Sorry, I could not find any relevant information on that topic in the knowledge base or chat history.", metrics
+                return "Sorry, I could not find any relevant information on that topic in the knowledge base or your chat history.", metrics
             
             # Step 3: Generation using the retrieved context
             start_generation = time.time()
-            prompt = f"""You are a STRICT knowledge agent.  
+            prompt = f"""You are a STRICT knowledge agent. 
 
-Your job is ONLY to answer questions using the provided CONTEXT (retrieved documents) and the CONVERSATION HISTORY.  
-- Do NOT use your own brain, prior knowledge, or outside assumptions.  
-- Do NOT generate facts, explanations, or background information unless it is explicitly found in the CONTEXT or CONVERSATION HISTORY.  
-- If the answer cannot be found directly in the CONTEXT or CONVERSATION HISTORY, you MUST reply with exactly:  
+Your job is ONLY to answer questions using the provided CONTEXT (retrieved documents) and the CONVERSATION HISTORY. 
+- Do NOT use your own brain, prior knowledge, or outside assumptions. 
+- Do NOT generate facts, explanations, or background information unless it is explicitly found in the CONTEXT or CONVERSATION HISTORY. 
+- If the answer cannot be found directly in the CONTEXT or CONVERSATION HISTORY, you MUST reply with exactly: 
 "Sorry, I could not find relevant information in the knowledge base."
 
 CONTEXT (retrieved documents from knowledge base AND chat history):
@@ -318,7 +335,7 @@ Answer strictly from CONTEXT and CONVERSATION HISTORY only.
             metrics["generation_tokens"] = response.usage.total_tokens
             metrics["total_latency"] = end_generation - start_total
             
-            print(f"---  RAG system generated a contextual answer. ---")
+            print(f"--- RAG system generated a contextual answer. ---")
             return answer, metrics
         except Exception as e:
             error_message = f"An error occurred during the RAG process: {str(e)}"
@@ -332,8 +349,8 @@ class RAGAssistantAgent(ConversableAgent):
         super().__init__(**kwargs)
         self.rag_system = rag_system
 
-    async def on_messages(self, messages: List[TextMessage], cancellation_token: CancellationToken) -> Tuple[TextMessage, dict]:
-        rag_response, metrics = self.rag_system.retrieve_and_answer(messages)
+    async def on_messages(self, messages: List[TextMessage], cancellation_token: CancellationToken, user_id: str) -> Tuple[TextMessage, dict]:
+        rag_response, metrics = self.rag_system.retrieve_and_answer(messages, user_id)
         return TextMessage(content=rag_response, source=self.name), metrics
 
 async def get_agent(history: list[dict[str, Any]], rag_system: RAGSystem) -> RAGAssistantAgent:
@@ -357,12 +374,13 @@ async def root():
 async def ingest_documents():
     return rag_system.ingest_docs()
 
-@app.get("/history")
-async def get_history() -> list[dict[str, Any]]:
+async def get_history_for_user(user_id: str) -> list[dict[str, Any]]:
+    """Loads chat history from a user-specific file."""
+    history_file_path = os.path.join(HISTORY_DIR, f"agent_history_{user_id}.json")
     try:
-        if not os.path.exists(HISTORY_PATH):
+        if not os.path.exists(history_file_path):
             return []
-        async with aiofiles.open(HISTORY_PATH, "r") as file:
+        async with aiofiles.open(history_file_path, "r") as file:
             contents = await file.read()
             if not contents.strip():
                 return []
@@ -370,8 +388,8 @@ async def get_history() -> list[dict[str, Any]]:
     except FileNotFoundError:
         return []
     except json.JSONDecodeError:
-        print(f"❗ Error: Failed to decode JSON from {HISTORY_PATH}. File might be corrupted.")
-        return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"message": "Corrupted history file."})
+        print(f"❗ Error: Failed to decode JSON from {history_file_path}. File might be corrupted.")
+        return []
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An error occurred while loading history: {str(e)}") from e
 
@@ -390,49 +408,57 @@ async def get_metrics():
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An error occurred: {str(e)}")
 
 # --- WEBSOCKET ENDPOINT ---
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
     await websocket.accept()
-    history_list = []
+    
+    # Load history at the start of the connection for the specific user
+    history_list = await get_history_for_user(user_id)
+    if not isinstance(history_list, list):
+        history_list = []
+    
+    # Send history to the client upon connection
+    await websocket.send_json({"type": "history", "content": history_list})
     
     try:
-        # Load history at the start of the connection
-        history_list = await get_history()
-        if not isinstance(history_list, list):
-            history_list = []
-
         while True:
-            # Receive message from the client
             data = await websocket.receive_text()
-            request_data = json.loads(data)
-            request = TextMessage(**request_data)
+            
+            with tracer.start_as_current_span("chat_message") as span:
+                span.set_attribute("user.id", user_id)
+                span.set_attribute("user.input", data)
 
-            # Ingest the new user message into the history collection
-            rag_system.ingest_message(request)
+                request_data = json.loads(data)
+                request = TextMessage(**request_data)
+
+              # Ingest the new user message into the history collection with user_id
+                rag_system.ingest_message(request, user_id)
             
-            history_list.append(request.model_dump())
+                history_list.append(request.model_dump())
             
-            agent = await get_agent(history=history_list, rag_system=rag_system)
+                agent = await get_agent(history=history_list, rag_system=rag_system)
             
-            response, metrics = await agent.on_messages(
-                messages=[TextMessage(**msg) for msg in history_list], 
-                cancellation_token=CancellationToken()
-            )
+                response, metrics = await agent.on_messages(
+                  messages=[TextMessage(**msg) for msg in history_list], 
+                  cancellation_token=CancellationToken(),
+                  user_id=user_id
+                )
+
+                span.set_attribute("assistant.response", response.content)
             
             def safe_model_dump(obj):
-               return json.loads(json.dumps(obj, default=str))
+                return json.loads(json.dumps(obj, default=str))
             
-            # Ingest the new agent response into the history collection
-            rag_system.ingest_message(response)
+            # Ingest the new agent response into the history collection with user_id
+            rag_system.ingest_message(response, user_id)
             
             history_list.append(response.model_dump())
             
-            await _record_metrics(metrics)
+            # await _record_metrics(metrics)
             
-            # --- FIX APPLIED HERE ---
-            # The original code's `json.dumps` call needs to handle non-serializable objects.
-            # The `default=str` argument handles datetime and other types by converting them to strings.
-            async with aiofiles.open(HISTORY_PATH, "w") as file:
+            # Save the updated history to the user's specific file
+            history_file_path = os.path.join(HISTORY_DIR, f"agent_history_{user_id}.json")
+            async with aiofiles.open(history_file_path, "w") as file:
                 await file.write(json.dumps(history_list, indent=2, default=str))
                 
             assert isinstance(response, TextMessage)
@@ -440,11 +466,10 @@ async def websocket_endpoint(websocket: WebSocket):
             # Send the response back to the client
             await websocket.send_json(safe_model_dump(response.model_dump()))
 
-
     except WebSocketDisconnect:
-        print("Client disconnected.")
+        print(f"Client '{user_id}' disconnected.")
     except Exception as e:
-        print(f"An unexpected error occurred in the WebSocket endpoint: {e}")
+        print(f"An unexpected error occurred in the WebSocket endpoint for user '{user_id}': {e}")
         error_message = {
             "type": "error",
             "content": "An internal server error occurred.",
