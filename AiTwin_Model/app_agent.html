@@ -165,8 +165,10 @@
         const sendButton = document.getElementById('send-btn');
         const ingestButton = document.getElementById('ingest-btn');
         const statusElement = document.getElementById('connection-status');
-        const serverUrl = 'ws://localhost:8001/ws';
+        const websocketBaseUrl = 'ws://localhost:8001/ws';
+        const httpBaseUrl = 'http://localhost:8001';
         let ws;
+        let userId = '';
 
         function connectWebSocket() {
             if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
@@ -174,18 +176,38 @@
                 return;
             }
 
-            ws = new WebSocket(serverUrl);
+            // Prompt for user ID or generate a new one
+            userId = prompt("Please enter your User ID or click 'Cancel' to get a new session:", `user_${Math.random().toString(36).substring(2, 8)}`);
+            if (userId === null) {
+                // Generate a random ID if the user cancels
+                userId = `guest_${Math.random().toString(36).substring(2, 10)}`;
+                displayMessage(`Starting a new session with User ID: ${userId}`, 'system');
+            } else if (userId === "") {
+                // Use a default name if the user enters nothing
+                userId = `guest_${Math.random().toString(36).substring(2, 10)}`;
+                displayMessage(`Using a default session ID: ${userId}`, 'system');
+            } else {
+                displayMessage(`Connecting with User ID: ${userId}`, 'system');
+            }
+
+            const wsUrl = `${websocketBaseUrl}/${userId}`;
+            ws = new WebSocket(wsUrl);
 
             ws.onopen = function () {
-                console.log("WebSocket connection established.");
+                console.log(`WebSocket connection established for user: ${userId}.`);
                 statusElement.textContent = 'Connected';
                 statusElement.style.color = '#28a745';
-                loadHistory(); // Load history after connection is open
+                enableControls();
             };
 
             ws.onmessage = function (event) {
                 const data = JSON.parse(event.data);
-                if (data.type === 'error') {
+                if (data.type === 'history') {
+                    // This is the initial history message from the server
+                    data.content.forEach(message => {
+                        displayMessage(message.content, message.source);
+                    });
+                } else if (data.type === 'error') {
                     displayMessage(data.content, 'error');
                 } else {
                     displayMessage(data.content, data.source);
@@ -233,10 +255,8 @@
             const message = messageInput.value.trim();
             if (!message || ws.readyState !== WebSocket.OPEN) return;
 
-            // Display user message
             displayMessage(message, 'user');
 
-            // Clear input and disable controls while waiting for a response
             messageInput.value = '';
             disableControls();
 
@@ -249,7 +269,7 @@
             displayMessage('Ingestion started. Please wait...', 'system');
 
             try {
-                const response = await fetch('http://localhost:8001/ingest', {
+                const response = await fetch(`${httpBaseUrl}/ingest`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
@@ -284,22 +304,7 @@
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
         }
 
-        async function loadHistory() {
-            try {
-                const response = await fetch('http://localhost:8001/history');
-                if (!response.ok) {
-                    throw new Error('Network response was not ok');
-                }
-                const history = await response.json();
-                history.forEach(message => {
-                    displayMessage(message.content, message.source);
-                });
-            } catch (error) {
-                console.error('Error loading history:', error);
-            }
-        }
-
-        // Connect to WebSocket and load history on page load
+        // Connect to WebSocket on page load
         window.onload = function () {
             connectWebSocket();
         };
