@@ -1,20 +1,37 @@
-# ag2[retrievechat]==0.9.9
-# chromadb==1.0.16
-# sentence-transformers==3.0.1
-# protobuf==6.31.1
-# httpx==0.28.1
-# ag2[openai]
-
-autogen-agentchat
-autogen-ext[openai]
-fastapi 
-uvicorn[standard] 
-PyYAML
+# ---- Core ----
+fastapi
+uvicorn[standard]
 aiofiles
+PyYAML
+websockets
 
-fitz
-frontend
-tools
+# ---- Autogen / Agents ----
+autogen
+autogen-agentchat
+autogen-agentchat[websockets]>=0.2
+autogen-ext[openai]
+openai
+
+# ---- Chroma / Embeddings ----
+chromadb==1.0.16
+sentence-transformers==3.0.1
+protobuf==6.31.1
+httpx==0.28.1
+
+# ---- NLP / ML ----
 transformers
 torch
-autogen
+
+# ---- PDF / Utils ----
+PyMuPDF  # provides fitz
+
+# ---- Observability ----
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+opentelemetry-instrumentation-fastapi
+
+# ---- Optional (commented for now) ----
+# ag2[retrievechat]==0.9.9
+# ag2[openai]
+# frontend
+# tools
