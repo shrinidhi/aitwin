@@ -6,10 +6,12 @@ import chromadb
 import hashlib
 import fitz
 import re
+import asyncio
 from transformers import AutoTokenizer, AutoModel
 import torch
 from openai import OpenAI
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, Dict
+import yaml
 
 import aiofiles
 from autogen import ConversableAgent
@@ -29,7 +31,6 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 
 trace.set_tracer_provider(TracerProvider())
 tracer = trace.get_tracer(__name__)
-
 
 otlp_exporter = OTLPSpanExporter(endpoint="http://localhost:4318/v1/traces")
 trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
@@ -52,6 +53,45 @@ METRICS_PATH = "metrics.json"
 CHROMA_DB_PATH = os.environ.get("CHROMA_DB_PATH", "./chroma_db")
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./tmp/chromadb")
 
+
+# --- QUEUE AND CONNECTION MANAGEMENT ---
+class QueueManager:
+    """Manages WebSocket connections and per-user message queues."""
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+        self.message_queues: Dict[str, asyncio.Queue] = {}
+
+    async def connect(self, websocket: WebSocket, user_id: str):
+        await websocket.accept()
+        self.active_connections[user_id] = websocket
+        self.message_queues[user_id] = asyncio.Queue()
+        print(f"Client '{user_id}' connected. Total connections: {len(self.active_connections)}")
+
+    def disconnect(self, user_id: str):
+        if user_id in self.active_connections:
+            # Signal the processor to shut down
+            if user_id in self.message_queues:
+                self.message_queues[user_id].put_nowait(None)
+                del self.message_queues[user_id]
+            del self.active_connections[user_id]
+        print(f"Client '{user_id}' disconnected. Total connections: {len(self.active_connections)}")
+
+    async def get_message(self, user_id: str):
+        if user_id in self.message_queues:
+            return await self.message_queues[user_id].get()
+        return None
+    
+    async def send_message(self, user_id: str, message: Any):
+        if user_id in self.active_connections:
+            await self.active_connections[user_id].send_json(message)
+
+    @property
+    def connection_count(self) -> int:
+        return len(self.active_connections)
+
+queue_manager = QueueManager()
+
+
 # --- UTILITY FUNCTIONS FOR METRICS ---
 async def _record_metrics(data: dict):
     """Safely appends a new metric entry to the metrics JSON file."""
@@ -66,16 +106,23 @@ async def _record_metrics(data: dict):
         await file.seek(0)
         await file.truncate()
         await file.write(json.dumps(metrics_list, indent=2, default=str))
+        
+
+def load_llm_config(filepath: str) -> dict:
+    with open(filepath, 'r') as file:
+        return yaml.safe_load(file)        
 
 # --- RAG PIPELINE CONFIGURATION ---
 class RAGSystem:
-    def __init__(self, collection_name: str, history_collection_name: str, upload_dir: str, doc_extension: str = "*.{txt,pdf}", model_name: str = "sentence-transformers/all-MiniLM-L6-v2", batch_size: int = 50):
+    def __init__(self, config_list: List[dict],collection_name: str, history_collection_name: str, upload_dir: str, doc_extension: str = "*.{txt,pdf}", model_name: str = "sentence-transformers/all-MiniLM-L6-v2", batch_size: int = 50):
         self.collection_name = collection_name
         self.history_collection_name = history_collection_name
         self.upload_dir = upload_dir
         self.doc_extension = doc_extension
         self.batch_size = batch_size
         self.hf_model = model_name
+        self.primary_llm_config = next(cfg for cfg in config_list if cfg.get("type") == "primary_response")
+        self.rephrase_llm_config = next(cfg for cfg in config_list if cfg.get("type") == "rephrase_response")
         
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(self.hf_model)
@@ -92,7 +139,6 @@ class RAGSystem:
             self.collection = self.chroma_client.create_collection(name=self.collection_name)
             print(f"Collection '{self.collection_name}' created.")
             
-        # New collection for chat history
         try:
             self.history_collection = self.chroma_client.get_or_create_collection(name=self.history_collection_name)
             print(f"History collection '{self.history_collection_name}' found or created.")
@@ -238,33 +284,30 @@ class RAGSystem:
         }
         
         try:
-            client = OpenAI(base_url="http://127.0.0.1:11433/v1", api_key="not-needed")
+            client = OpenAI(
+                base_url=self.rephrase_llm_config["base_url"],
+                api_key=self.rephrase_llm_config["api_key"]
+                )
             
-            # Step 1: Condense conversation to standalone query
             start_rephrase = time.time()
             rephrase_prompt = f"""You are a STRICT rephrasing agent.
-
 Your ONLY task is to take the given conversation history and the follow-up question, 
 and restate the follow-up question as a clear standalone question. 
-
 Rules:
 - Use ONLY the information from the CONVERSATION HISTORY and the FOLLOW-UP QUESTION. 
 - Do NOT add, assume, or invent any new details. 
 - If the follow-up question is already standalone, return it unchanged. 
-
 CONVERSATION HISTORY:
 {history}
-
 FOLLOW-UP QUESTION:
 {latest_query}
-
 Standalone Question:"""
 
             rephrased_response = client.chat.completions.create(
-                model="mistralai/mistral-7b-instruct-v0.3",
+                model=self.rephrase_llm_config["model"],
                 messages=[{"role": "user", "content": rephrase_prompt}],
-                temperature=0.3,
-                max_tokens=200,
+                temperature=self.rephrase_llm_config["temperature"],
+                max_tokens=self.rephrase_llm_config["max_tokens"],
             )
             end_rephrase = time.time()
             standalone_query = rephrased_response.choices[0].message.content.strip()
@@ -272,13 +315,10 @@ Standalone Question:"""
             metrics["rephrase_tokens"] = rephrased_response.usage.total_tokens
             print(f" Rephrased standalone query: '{standalone_query}'")
             
-            # Step 2: Retrieval using the standalone query
             start_retrieval = time.time()
             query_emb = self.embed_texts([standalone_query])[0]
             
-            # Query the knowledge base (no user filter needed)
             kb_results = self.collection.query(query_embeddings=[query_emb], n_results=5)
-            # Query the chat history, filtering by user_id
             history_results = self.history_collection.query(
                 query_embeddings=[query_emb],
                 n_results=5,
@@ -287,7 +327,6 @@ Standalone Question:"""
             
             end_retrieval = time.time()
             
-            # Combine documents from both collections
             kb_docs = kb_results.get("documents", [[]])[0]
             history_docs = history_results.get("documents", [[]])[0]
             combined_docs = kb_docs + history_docs
@@ -300,33 +339,27 @@ Standalone Question:"""
                 metrics["total_latency"] = time.time() - start_total
                 return "Sorry, I could not find any relevant information on that topic in the knowledge base or your chat history.", metrics
             
-            # Step 3: Generation using the retrieved context
             start_generation = time.time()
             prompt = f"""You are a STRICT knowledge agent. 
-
 Your job is ONLY to answer questions using the provided CONTEXT (retrieved documents) and the CONVERSATION HISTORY. 
 - Do NOT use your own brain, prior knowledge, or outside assumptions. 
 - Do NOT generate facts, explanations, or background information unless it is explicitly found in the CONTEXT or CONVERSATION HISTORY. 
 - If the answer cannot be found directly in the CONTEXT or CONVERSATION HISTORY, you MUST reply with exactly: 
 "Sorry, I could not find relevant information in the knowledge base."
-
 CONTEXT (retrieved documents from knowledge base AND chat history):
 {context}
-
 CONVERSATION HISTORY:
 {history}
-
 QUESTION:
 {latest_query}
-
 Answer strictly from CONTEXT and CONVERSATION HISTORY only.
 """
 
             response = client.chat.completions.create(
-                model="mistralai/mistral-7b-instruct-v0.3",
+                model=self.primary_llm_config["model"],
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=800,
+                temperature=self.primary_llm_config["temperature"],
+                max_tokens=self.primary_llm_config["max_tokens"],
             )
             end_generation = time.time()
             
@@ -362,8 +395,29 @@ async def get_agent(history: list[dict[str, Any]], rag_system: RAGSystem) -> RAG
     agent._history = history
     return agent
 
-# Initialize RAGSystem globally
-rag_system = RAGSystem(collection_name="generalized_collection", history_collection_name="chat_history_collection", upload_dir=UPLOAD_DIR, doc_extension="*.*", batch_size=100)
+
+
+#  Initialize RAGSystem globally
+try:
+    model_config = load_llm_config("model_config.yaml")
+    config_list = model_config.get("config_list", [])
+except FileNotFoundError:
+    print("Error: model.yaml not found. Please create it.")
+    exit()
+except Exception as e:
+    print(f"Error loading model.yaml: {e}")
+    exit()
+    
+rag_system = RAGSystem(
+    config_list=config_list,
+    collection_name="generalized_collection",
+    history_collection_name="chat_history_collection",
+    upload_dir=UPLOAD_DIR,
+    doc_extension="*.*",
+    batch_size=100
+    )
+# # Initialize RAGSystem globally
+# rag_system = RAGSystem(collection_name="generalized_collection", history_collection_name="chat_history_collection", upload_dir=UPLOAD_DIR, doc_extension="*.*", batch_size=100)
 
 # --- FASTAPI ENDPOINTS ---
 @app.get("/")
@@ -407,22 +461,26 @@ async def get_metrics():
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An error occurred: {str(e)}")
 
-# --- WEBSOCKET ENDPOINT ---
-@app.websocket("/ws/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: str):
-    await websocket.accept()
-    
-    # Load history at the start of the connection for the specific user
+@app.get("/connections")
+async def get_current_connections():
+    """Returns the number of currently active WebSocket connections."""
+    return JSONResponse(content={"active_connections": queue_manager.connection_count})
+
+async def task_processor(user_id: str):
+    """Background task to process messages from a user's queue."""
     history_list = await get_history_for_user(user_id)
     if not isinstance(history_list, list):
         history_list = []
     
     # Send history to the client upon connection
-    await websocket.send_json({"type": "history", "content": history_list})
-    
-    try:
-        while True:
-            data = await websocket.receive_text()
+    await queue_manager.send_message(user_id, {"type": "history", "content": history_list})
+
+    while True:
+        try:
+            data = await queue_manager.get_message(user_id)
+            if data is None:
+                # Disconnect signal received
+                break
             
             with tracer.start_as_current_span("chat_message") as span:
                 span.set_attribute("user.id", user_id)
@@ -431,17 +489,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                 request_data = json.loads(data)
                 request = TextMessage(**request_data)
 
-              # Ingest the new user message into the history collection with user_id
                 rag_system.ingest_message(request, user_id)
-            
                 history_list.append(request.model_dump())
-            
+                
                 agent = await get_agent(history=history_list, rag_system=rag_system)
-            
+                
                 response, metrics = await agent.on_messages(
-                  messages=[TextMessage(**msg) for msg in history_list], 
-                  cancellation_token=CancellationToken(),
-                  user_id=user_id
+                    messages=[TextMessage(**msg) for msg in history_list], 
+                    cancellation_token=CancellationToken(),
+                    user_id=user_id
                 )
 
                 span.set_attribute("assistant.response", response.content)
@@ -449,30 +505,58 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             def safe_model_dump(obj):
                 return json.loads(json.dumps(obj, default=str))
             
-            # Ingest the new agent response into the history collection with user_id
             rag_system.ingest_message(response, user_id)
-            
             history_list.append(response.model_dump())
             
             # await _record_metrics(metrics)
             
-            # Save the updated history to the user's specific file
             history_file_path = os.path.join(HISTORY_DIR, f"agent_history_{user_id}.json")
             async with aiofiles.open(history_file_path, "w") as file:
                 await file.write(json.dumps(history_list, indent=2, default=str))
                 
             assert isinstance(response, TextMessage)
             
-            # Send the response back to the client
-            await websocket.send_json(safe_model_dump(response.model_dump()))
+            await queue_manager.send_message(user_id, safe_model_dump(response.model_dump()))
 
+        except Exception as e:
+            print(f"An unexpected error occurred in the processor for user '{user_id}': {e}")
+            error_message = {
+                "type": "error",
+                "content": "An internal server error occurred.",
+                "source": "system"
+            }
+            await queue_manager.send_message(user_id, error_message)
+            # Break the loop to stop processing for this user
+            break
+
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    await queue_manager.connect(websocket, user_id)
+    
+    # Start the background task to process messages from the queue
+    processing_task = asyncio.create_task(task_processor(user_id))
+    
+    try:
+        # Loop to receive messages and place them in the queue
+        while True:
+            data = await websocket.receive_text()
+            if data is not None:
+                await queue_manager.message_queues[user_id].put(data)
     except WebSocketDisconnect:
-        print(f"Client '{user_id}' disconnected.")
-    except Exception as e:
-        print(f"An unexpected error occurred in the WebSocket endpoint for user '{user_id}': {e}")
-        error_message = {
-            "type": "error",
-            "content": "An internal server error occurred.",
-            "source": "system"
-        }
-        await websocket.send_json(error_message)
+        print(f"WebSocket disconnected for user '{user_id}'. Signaling processor to stop.")
+    finally:
+        queue_manager.disconnect(user_id)
+        if not processing_task.done():
+            processing_task.cancel()
+        try:
+            await processing_task
+        except asyncio.CancelledError:
+            pass
+        
+if __name__ == "__main__":
+
+    
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
+      
