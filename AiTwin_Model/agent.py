@@ -1,3 +1,25 @@
+"""
+This module provides a FastAPI application for a RAG (Retrieval-Augmented Generation) chatbot.
+
+The application serves a web interface, manages WebSocket connections for real-time
+chat, and implements a RAG pipeline to answer user questions based on a knowledge
+base and chat history. It uses ChromaDB for vector storage and HuggingFace models
+for text embedding.
+
+Key components:
+- `QueueManager`: Manages WebSocket connections and per-user message queues.
+- `RAGSystem`: Handles the core RAG logic, including document ingestion, text chunking,
+  embedding, retrieval from ChromaDB, and response generation using an LLM.
+- `RAGAssistantAgent`: An Autogen agent that integrates with the `RAGSystem` to
+  process chat messages and generate responses.
+- FastAPI Endpoints:
+  - `/`: Serves the main HTML file.
+  - `/ingest`: Triggers the ingestion of documents into the knowledge base.
+  - `/metrics`: Provides performance metrics for the RAG pipeline.
+  - `/connections`: Returns the number of active WebSocket connections.
+  - `/ws/{user_id}`: The WebSocket endpoint for chat communication.
+"""
+
 import json
 import os
 import time
@@ -22,18 +44,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+# NEW: Import the DebugLogger
+from debugLogger import DebugLogger
 
-# ---- OpenTelemetry ----
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+# OLD: Remove the manual OpenTelemetry setup. The DebugLogger handles this.
+# from opentelemetry import trace
+# from opentelemetry.sdk.trace import TracerProvider
+# from opentelemetry.sdk.trace.export import BatchSpanProcessor
+# from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+# trace.set_tracer_provider(TracerProvider())
+# tracer = trace.get_tracer(__name__)
+# otlp_exporter = OTLPSpanExporter(endpoint="http://localhost:4318/v1/traces")
+# trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
 
-trace.set_tracer_provider(TracerProvider())
-tracer = trace.get_tracer(__name__)
-
-otlp_exporter = OTLPSpanExporter(endpoint="http://localhost:4318/v1/traces")
-trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
+# NEW: Initialize the centralized debugger
+debugger = DebugLogger(service_name="rag-chatbot")
 
 # --- FASTAPI SETUP ---
 app = FastAPI()
@@ -58,35 +83,71 @@ UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./tmp/chromadb")
 class QueueManager:
     """Manages WebSocket connections and per-user message queues."""
     def __init__(self):
+        """Initializes the QueueManager with empty dictionaries for connections and queues."""
         self.active_connections: Dict[str, WebSocket] = {}
         self.message_queues: Dict[str, asyncio.Queue] = {}
 
     async def connect(self, websocket: WebSocket, user_id: str):
+        """
+        Accepts a new WebSocket connection and initializes a message queue for the user.
+
+        Args:
+            websocket (WebSocket): The new WebSocket connection.
+            user_id (str): A unique identifier for the user.
+        """
         await websocket.accept()
         self.active_connections[user_id] = websocket
         self.message_queues[user_id] = asyncio.Queue()
-        print(f"Client '{user_id}' connected. Total connections: {len(self.active_connections)}")
+        debugger.log("Client connected", user_id=user_id, total_connections=len(self.active_connections))
 
     def disconnect(self, user_id: str):
+        """
+        Disconnects a user by removing their WebSocket connection and message queue.
+
+        Args:
+            user_id (str): The unique identifier of the user to disconnect.
+        """
         if user_id in self.active_connections:
             # Signal the processor to shut down
             if user_id in self.message_queues:
                 self.message_queues[user_id].put_nowait(None)
                 del self.message_queues[user_id]
             del self.active_connections[user_id]
-        print(f"Client '{user_id}' disconnected. Total connections: {len(self.active_connections)}")
+        debugger.log("Client disconnected", user_id=user_id, total_connections=len(self.active_connections))
 
     async def get_message(self, user_id: str):
+        """
+        Retrieves the next message from a user's queue.
+
+        Args:
+            user_id (str): The unique identifier for the user.
+
+        Returns:
+            Any: The message from the queue, or None if the queue doesn't exist.
+        """
         if user_id in self.message_queues:
             return await self.message_queues[user_id].get()
         return None
     
     async def send_message(self, user_id: str, message: Any):
+        """
+        Sends a JSON message to a specific user's WebSocket.
+
+        Args:
+            user_id (str): The unique identifier for the user.
+            message (Any): The JSON-serializable message to send.
+        """
         if user_id in self.active_connections:
             await self.active_connections[user_id].send_json(message)
 
     @property
     def connection_count(self) -> int:
+        """
+        Returns the number of currently active WebSocket connections.
+        
+        Returns:
+            int: The number of active connections.
+        """
         return len(self.active_connections)
 
 queue_manager = QueueManager()
@@ -94,7 +155,12 @@ queue_manager = QueueManager()
 
 # --- UTILITY FUNCTIONS FOR METRICS ---
 async def _record_metrics(data: dict):
-    """Safely appends a new metric entry to the metrics JSON file."""
+    """
+    Safely appends a new metric entry to the metrics JSON file.
+
+    Args:
+        data (dict): A dictionary containing metric data to be recorded.
+    """
     if not os.path.exists(METRICS_PATH):
         async with aiofiles.open(METRICS_PATH, "w") as file:
             await file.write(json.dumps([]))
@@ -109,12 +175,41 @@ async def _record_metrics(data: dict):
         
 
 def load_llm_config(filepath: str) -> dict:
+    """
+    Loads and parses a YAML configuration file for LLMs.
+
+    Args:
+        filepath (str): The path to the YAML configuration file.
+
+    Returns:
+        dict: The loaded configuration as a dictionary.
+    """
     with open(filepath, 'r') as file:
-        return yaml.safe_load(file)        
+        return yaml.safe_load(file) 
+            
 
 # --- RAG PIPELINE CONFIGURATION ---
 class RAGSystem:
-    def __init__(self, config_list: List[dict],collection_name: str, history_collection_name: str, upload_dir: str, doc_extension: str = "*.{txt,pdf}", model_name: str = "sentence-transformers/all-MiniLM-L6-v2", batch_size: int = 50):
+    """
+    Manages the Retrieval-Augmented Generation pipeline.
+
+    This class handles document ingestion, text embedding, retrieval from a vector database,
+    and generating responses using a Large Language Model (LLM).
+    """
+    def __init__(self, config_list: List[dict], prompt_file: str, collection_name: str, history_collection_name: str, upload_dir: str, doc_extension: str = "*.{txt,pdf}", model_name: str = "sentence-transformers/all-MiniLM-L6-v2", batch_size: int = 50):
+        """
+        Initializes the RAGSystem with configurations and database clients.
+
+        Args:
+            config_list (List[dict]): A list of LLM configurations.
+            prompt_file (str): The file path to the YAML file containing prompt templates.
+            collection_name (str): The name of the ChromaDB collection for the knowledge base.
+            history_collection_name (str): The name of the ChromaDB collection for chat history.
+            upload_dir (str): The directory where documents for ingestion are stored.
+            doc_extension (str): The file extension pattern for documents to ingest.
+            model_name (str): The name of the HuggingFace model for embedding.
+            batch_size (int): The batch size for processing documents.
+        """
         self.collection_name = collection_name
         self.history_collection_name = history_collection_name
         self.upload_dir = upload_dir
@@ -123,35 +218,76 @@ class RAGSystem:
         self.hf_model = model_name
         self.primary_llm_config = next(cfg for cfg in config_list if cfg.get("type") == "primary_response")
         self.rephrase_llm_config = next(cfg for cfg in config_list if cfg.get("type") == "rephrase_response")
+        self.prompts = self._load_prompts(prompt_file)
         
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(self.hf_model)
             self.model = AutoModel.from_pretrained(self.hf_model)
         except Exception as e:
-            print(f"Failed to load HuggingFace models: {e}")
+            debugger.log(f"Failed to load HuggingFace models: {e}", level="error")
             raise RuntimeError("Model loading failed.")
         
         self.chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         try:
             self.collection = self.chroma_client.get_collection(name=self.collection_name)
-            print(f"Collection '{self.collection_name}' found.")
+            debugger.log(f"Collection '{self.collection_name}' found.", level="info")
         except Exception:
             self.collection = self.chroma_client.create_collection(name=self.collection_name)
-            print(f"Collection '{self.collection_name}' created.")
+            debugger.log(f"Collection '{self.collection_name}' created.", level="info")
             
         try:
             self.history_collection = self.chroma_client.get_or_create_collection(name=self.history_collection_name)
-            print(f"History collection '{self.history_collection_name}' found or created.")
+            debugger.log(f"History collection '{self.history_collection_name}' found or created.", level="info")
         except Exception as e:
-            print(f"Failed to get/create history collection: {e}")
-
+            debugger.log(f"Failed to get/create history collection: {e}", level="error")
+            
+    def _load_prompts(self, filepath: str) -> dict:
+        """
+        Loads and parses a YAML configuration file for prompts.
+        
+        Args:
+            filepath (str): The path to the YAML configuration file.
+        
+        Returns:
+            dict: The loaded configuration as a dictionary, or an empty dict on error.
+        """
+        try:
+            with open(filepath, 'r') as file:
+                return yaml.safe_load(file).get('prompts', {})
+        except FileNotFoundError:
+            debugger.log(f"Warning: Prompt file '{filepath}' not found. Using default prompts.", level="warning")
+            return {}
+        except Exception as e:
+            debugger.log(f"Error loading prompt file '{filepath}': {e}. Using default prompts.", level="error")
+            return {} 
+            
     def embed_texts(self, texts: list[str]):
+        """
+        Generates embeddings for a list of text documents using the HuggingFace model.
+
+        Args:
+            texts (list[str]): A list of strings to embed.
+
+        Returns:
+            list: A list of embedding vectors.
+        """
         inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
         with torch.no_grad():
             embeddings = self.model(**inputs).last_hidden_state.mean(dim=1)
         return embeddings.numpy().tolist()
 
     def _chunk_text(self, text, chunk_size=600, overlap=120):
+        """
+        Splits a long text into smaller, overlapping chunks.
+
+        Args:
+            text (str): The text to be chunked.
+            chunk_size (int): The desired size of each chunk.
+            overlap (int): The number of characters to overlap between chunks.
+
+        Returns:
+            list[str]: A list of text chunks.
+        """
         chunks = []
         start = 0
         while start < len(text):
@@ -164,9 +300,27 @@ class RAGSystem:
         return [c.strip() for c in chunks if c.strip()]
 
     def _make_id(self, text):
+        """
+        Generates a unique ID for a text chunk using a hash function.
+
+        Args:
+            text (str): The text chunk to hash.
+
+        Returns:
+            str: The MD5 hash of the text.
+        """
         return hashlib.md5(text.encode("utf-8")).hexdigest()
 
     def _normalize_roman_numerals(self, text):
+        """
+        Converts Roman numerals in text to Arabic numerals.
+
+        Args:
+            text (str): The text to normalize.
+
+        Returns:
+            str: The text with Roman numerals converted.
+        """
         roman_to_arabic = {
             'I': '1', 'II': '2', 'III': '3', 'IV': '4', 'V': '5',
             'VI': '6', 'VII': '7', 'VIII': '8', 'IX': '9', 'X': '10',
@@ -177,21 +331,30 @@ class RAGSystem:
         return text
 
     def ingest_docs(self) -> JSONResponse:
+        """
+        Ingests all documents from the upload directory into the ChromaDB collection.
+
+        The function clears existing documents, reads new ones (txt or pdf),
+        chunks them, and upserts them into the database.
+
+        Returns:
+            JSONResponse: A response indicating the status of the ingestion process.
+        """
         files = glob.glob(os.path.join(self.upload_dir, f"**/{self.doc_extension}"), recursive=True)
         if not files:
             message = f"No documents found in '{self.upload_dir}' with extension '{self.doc_extension}'."
-            print(message)
+            debugger.log(message, level="warning")
             return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"message": message})
         
         if self.collection.count() > 0:
-            print("Clearing existing documents...")
+            debugger.log("Clearing existing documents...")
             self.collection.delete(ids=self.collection.get(include=[])['ids'])
         
         start = time.time()
         total_chunks = 0
         
         for doc_path in files:
-            print(f"Ingesting knowledge base file: {doc_path}")
+            debugger.log(f"Ingesting knowledge base file: {doc_path}")
             
             file_extension = os.path.splitext(doc_path)[1].lower()
             full_text = ""
@@ -205,7 +368,7 @@ class RAGSystem:
                         full_text += page.get_text()
                     doc.close()
                 else:
-                    print(f" Skipping unsupported file type: {file_extension} for {doc_path}")
+                    debugger.log(f" Skipping unsupported file type: {file_extension} for {doc_path}", level="warning")
                     continue
                 
                 full_text = self._normalize_roman_numerals(full_text)
@@ -228,20 +391,26 @@ class RAGSystem:
                     ids=ids_to_add,
                     metadatas=metadatas_to_add
                 )
-                print(f" Upserted {len(documents_to_add)} documents from {os.path.basename(doc_path)}.")
+                debugger.log(f"Upserted {len(documents_to_add)} documents from {os.path.basename(doc_path)}.", num_docs=len(documents_to_add), source=os.path.basename(doc_path))
                 total_chunks += len(documents_to_add)
 
             except Exception as e:
-                print(f" Failed to process document {doc_path}: {e}")
+                debugger.log(f"Failed to process document {doc_path}: {e}", level="error", doc_path=doc_path)
         
         end = time.time()
         
         message = f" Ingestion & indexing of {total_chunks} docs completed in {end-start:.2f} seconds."
-        print(message)
+        debugger.log(message, total_chunks=total_chunks, duration=end-start)
         return JSONResponse(status_code=status.HTTP_200_OK, content={"message": message})
 
     def ingest_message(self, message: TextMessage, user_id: str):
-        """Ingests a single message into the chat history collection with user metadata."""
+        """
+        Ingests a single chat message into the chat history collection with user metadata.
+
+        Args:
+            message (TextMessage): The message object to ingest.
+            user_id (str): The unique identifier of the user who sent the message.
+        """
         if not message.content:
             return
         
@@ -258,13 +427,29 @@ class RAGSystem:
                 ids=[message_id],
                 metadatas=[metadata]
             )
-            print(f"Ingested message from '{message.source}' for user '{user_id}' into history collection.")
+            debugger.log(f"Ingested message from '{message.source}' for user '{user_id}' into history collection.", source=message.source, user_id=user_id)
         except Exception as e:
-            print(f"Failed to ingest message into history collection for user '{user_id}': {e}")
+            debugger.log(f"Failed to ingest message into history collection for user '{user_id}': {e}", level="error", user_id=user_id)
 
     def retrieve_and_answer(self, messages: List[TextMessage], user_id: str) -> Tuple[str, dict]:
+        """
+        Executes the full RAG pipeline for a given conversation.
+
+        The process includes:
+        1. Rephrasing the latest query into a standalone question using a LLM.
+        2. Retrieving relevant documents from the knowledge base and chat history.
+        3. Generating a final answer based on the retrieved context using a primary LLM.
+
+        Args:
+            messages (List[TextMessage]): The list of all messages in the current conversation.
+            user_id (str): The unique identifier of the user.
+
+        Returns:
+            Tuple[str, dict]: A tuple containing the generated answer and a dictionary
+                              of performance metrics.
+        """
         start_total = time.time()
-        print(f"\n--- RAG pipeline executing for user '{user_id}' with conversation history. ---")
+        debugger.log(f"--- RAG pipeline executing for user '{user_id}' with conversation history. ---", user_id=user_id)
         
         latest_query = messages[-1].content
         
@@ -287,22 +472,14 @@ class RAGSystem:
             client = OpenAI(
                 base_url=self.rephrase_llm_config["base_url"],
                 api_key=self.rephrase_llm_config["api_key"]
-                )
+            )
             
             start_rephrase = time.time()
-            rephrase_prompt = f"""You are a STRICT rephrasing agent.
-Your ONLY task is to take the given conversation history and the follow-up question, 
-and restate the follow-up question as a clear standalone question. 
-Rules:
-- Use ONLY the information from the CONVERSATION HISTORY and the FOLLOW-UP QUESTION. 
-- Do NOT add, assume, or invent any new details. 
-- If the follow-up question is already standalone, return it unchanged. 
-CONVERSATION HISTORY:
-{history}
-FOLLOW-UP QUESTION:
-{latest_query}
-Standalone Question:"""
-
+            rephrase_prompt_template = self.prompts.get("rephrase_prompt_v1", "Default rephrase prompt not found.")
+            rephrase_prompt = rephrase_prompt_template.format(
+                history=history,
+                latest_query=latest_query
+            )
             rephrased_response = client.chat.completions.create(
                 model=self.rephrase_llm_config["model"],
                 messages=[{"role": "user", "content": rephrase_prompt}],
@@ -313,7 +490,7 @@ Standalone Question:"""
             standalone_query = rephrased_response.choices[0].message.content.strip()
             metrics["rephrase_latency"] = end_rephrase - start_rephrase
             metrics["rephrase_tokens"] = rephrased_response.usage.total_tokens
-            print(f" Rephrased standalone query: '{standalone_query}'")
+            debugger.log(f"Rephrased standalone query: '{standalone_query}'", standalone_query=standalone_query)
             
             start_retrieval = time.time()
             query_emb = self.embed_texts([standalone_query])[0]
@@ -340,20 +517,14 @@ Standalone Question:"""
                 return "Sorry, I could not find any relevant information on that topic in the knowledge base or your chat history.", metrics
             
             start_generation = time.time()
-            prompt = f"""You are a STRICT knowledge agent. 
-Your job is ONLY to answer questions using the provided CONTEXT (retrieved documents) and the CONVERSATION HISTORY. 
-- Do NOT use your own brain, prior knowledge, or outside assumptions. 
-- Do NOT generate facts, explanations, or background information unless it is explicitly found in the CONTEXT or CONVERSATION HISTORY. 
-- If the answer cannot be found directly in the CONTEXT or CONVERSATION HISTORY, you MUST reply with exactly: 
-"Sorry, I could not find relevant information in the knowledge base."
-CONTEXT (retrieved documents from knowledge base AND chat history):
-{context}
-CONVERSATION HISTORY:
-{history}
-QUESTION:
-{latest_query}
-Answer strictly from CONTEXT and CONVERSATION HISTORY only.
-"""
+            primary_prompt_template = self.prompts.get("primary_prompt_v1", "Default primary prompt not found.")
+            prompt = primary_prompt_template.format(
+                context=context,
+                history=history,
+                latest_query=latest_query
+            )
+            
+            debugger.log("Primary LLM prompt generated")
 
             response = client.chat.completions.create(
                 model=self.primary_llm_config["model"],
@@ -368,25 +539,57 @@ Answer strictly from CONTEXT and CONVERSATION HISTORY only.
             metrics["generation_tokens"] = response.usage.total_tokens
             metrics["total_latency"] = end_generation - start_total
             
-            print(f"--- RAG system generated a contextual answer. ---")
+            debugger.log("RAG system generated a contextual answer.", answer=answer)
             return answer, metrics
         except Exception as e:
             error_message = f"An error occurred during the RAG process: {str(e)}"
-            print(f" {error_message}")
+            debugger.log(f"An unexpected error occurred in the processor: {e}", level="error", error_message=error_message)
             metrics["total_latency"] = time.time() - start_total
             return "Sorry, an internal error occurred while processing your request.", metrics
 
 # --- AGENT SETUP ---
 class RAGAssistantAgent(ConversableAgent):
+    """
+    An Autogen ConversableAgent that uses the RAGSystem to respond to messages.
+    """
     def __init__(self, rag_system: RAGSystem, **kwargs):
+        """
+        Initializes the agent with a reference to the RAGSystem.
+
+        Args:
+            rag_system (RAGSystem): The RAG system instance to use for generating responses.
+            **kwargs: Additional arguments for the ConversableAgent base class.
+        """
         super().__init__(**kwargs)
         self.rag_system = rag_system
 
     async def on_messages(self, messages: List[TextMessage], cancellation_token: CancellationToken, user_id: str) -> Tuple[TextMessage, dict]:
+        """
+        Handles incoming messages and generates a response using the RAG pipeline.
+
+        Args:
+            messages (List[TextMessage]): The list of messages in the conversation.
+            cancellation_token (CancellationToken): A token to check for cancellation.
+            user_id (str): The unique identifier of the user.
+
+        Returns:
+            Tuple[TextMessage, dict]: A tuple containing the generated response message
+                                      and the performance metrics.
+        """
         rag_response, metrics = self.rag_system.retrieve_and_answer(messages, user_id)
         return TextMessage(content=rag_response, source=self.name), metrics
 
 async def get_agent(history: list[dict[str, Any]], rag_system: RAGSystem) -> RAGAssistantAgent:
+    """
+    Creates and initializes a RAGAssistantAgent with the given history.
+
+    Args:
+        history (list[dict[str, Any]]): The conversation history to load into the agent.
+        rag_system (RAGSystem): The RAG system instance for the agent to use.
+
+    Returns:
+        RAGAssistantAgent: The initialized agent instance.
+    """
     agent = RAGAssistantAgent(
         name="assistant",
         system_message="You are a helpful assistant.",
@@ -396,40 +599,50 @@ async def get_agent(history: list[dict[str, Any]], rag_system: RAGSystem) -> RAG
     return agent
 
 
-
-#  Initialize RAGSystem globally
+#  Initialize RAGSystem globally
 try:
     model_config = load_llm_config("model_config.yaml")
     config_list = model_config.get("config_list", [])
 except FileNotFoundError:
-    print("Error: model.yaml not found. Please create it.")
+    debugger.log("Error: model.yaml not found. Please create it.", level="error")
     exit()
 except Exception as e:
-    print(f"Error loading model.yaml: {e}")
+    debugger.log(f"Error loading model.yaml: {e}", level="error")
     exit()
     
 rag_system = RAGSystem(
     config_list=config_list,
+    prompt_file="prompts.yaml",
     collection_name="generalized_collection",
     history_collection_name="chat_history_collection",
     upload_dir=UPLOAD_DIR,
     doc_extension="*.*",
     batch_size=100
-    )
+)
 # # Initialize RAGSystem globally
 # rag_system = RAGSystem(collection_name="generalized_collection", history_collection_name="chat_history_collection", upload_dir=UPLOAD_DIR, doc_extension="*.*", batch_size=100)
 
 # --- FASTAPI ENDPOINTS ---
 @app.get("/")
 async def root():
+    """Serves the main HTML page for the chatbot interface."""
     return FileResponse("app_agent.html")
 
 @app.post("/ingest")
 async def ingest_documents():
+    """Triggers the ingestion of documents into the RAG knowledge base."""
     return rag_system.ingest_docs()
 
 async def get_history_for_user(user_id: str) -> list[dict[str, Any]]:
-    """Loads chat history from a user-specific file."""
+    """
+    Loads chat history from a user-specific file.
+
+    Args:
+        user_id (str): The unique identifier of the user.
+
+    Returns:
+        list[dict[str, Any]]: The loaded chat history as a list of dictionaries.
+    """
     history_file_path = os.path.join(HISTORY_DIR, f"agent_history_{user_id}.json")
     try:
         if not os.path.exists(history_file_path):
@@ -442,14 +655,19 @@ async def get_history_for_user(user_id: str) -> list[dict[str, Any]]:
     except FileNotFoundError:
         return []
     except json.JSONDecodeError:
-        print(f"❗ Error: Failed to decode JSON from {history_file_path}. File might be corrupted.")
+        debugger.log(f"Failed to decode JSON from {history_file_path}. File might be corrupted.", level="error", file_path=history_file_path)
         return []
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An error occurred while loading history: {str(e)}") from e
 
 @app.get("/metrics")
 async def get_metrics():
-    """Returns the performance metrics for each chat response."""
+    """
+    Returns the performance metrics for each chat response.
+
+    Returns:
+        JSONResponse: A JSON object containing the recorded metrics.
+    """
     try:
         if not os.path.exists(METRICS_PATH):
             return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "No metrics data available yet."})
@@ -463,11 +681,24 @@ async def get_metrics():
 
 @app.get("/connections")
 async def get_current_connections():
-    """Returns the number of currently active WebSocket connections."""
+    """
+    Returns the number of currently active WebSocket connections.
+
+    Returns:
+        JSONResponse: A JSON object with the active connection count.
+    """
     return JSONResponse(content={"active_connections": queue_manager.connection_count})
 
 async def task_processor(user_id: str):
-    """Background task to process messages from a user's queue."""
+    """
+    Background task to process messages from a user's queue.
+
+    This task continuously listens for new messages in the queue, processes them
+    using the RAG system, and sends the response back to the client.
+
+    Args:
+        user_id (str): The unique identifier of the user.
+    """
     history_list = await get_history_for_user(user_id)
     if not isinstance(history_list, list):
         history_list = []
@@ -482,9 +713,9 @@ async def task_processor(user_id: str):
                 # Disconnect signal received
                 break
             
-            with tracer.start_as_current_span("chat_message") as span:
-                span.set_attribute("user.id", user_id)
-                span.set_attribute("user.input", data)
+            # REPLACED: Old OpenTelemetry span and attribute calls
+            with debugger.start_span("chat_message"):
+                debugger.log("Received message", user_id=user_id, user_input=data)
 
                 request_data = json.loads(data)
                 request = TextMessage(**request_data)
@@ -500,7 +731,7 @@ async def task_processor(user_id: str):
                     user_id=user_id
                 )
 
-                span.set_attribute("assistant.response", response.content)
+                debugger.log("Assistant response", response_content=response.content)
             
             def safe_model_dump(obj):
                 return json.loads(json.dumps(obj, default=str))
@@ -519,7 +750,7 @@ async def task_processor(user_id: str):
             await queue_manager.send_message(user_id, safe_model_dump(response.model_dump()))
 
         except Exception as e:
-            print(f"An unexpected error occurred in the processor for user '{user_id}': {e}")
+            debugger.log(f"An unexpected error occurred in the processor for user '{user_id}': {e}", level="error", user_id=user_id)
             error_message = {
                 "type": "error",
                 "content": "An internal server error occurred.",
@@ -532,7 +763,15 @@ async def task_processor(user_id: str):
 
 @app.websocket("/ws/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    """
+    Manages the WebSocket connection for a specific user.
+
+    Args:
+        websocket (WebSocket): The WebSocket connection object.
+        user_id (str): The unique identifier for the user.
+    """
     await queue_manager.connect(websocket, user_id)
+    debugger.log(f"WebSocket connected for user: {user_id}", user_id=user_id)
     
     # Start the background task to process messages from the queue
     processing_task = asyncio.create_task(task_processor(user_id))
@@ -544,7 +783,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             if data is not None:
                 await queue_manager.message_queues[user_id].put(data)
     except WebSocketDisconnect:
-        print(f"WebSocket disconnected for user '{user_id}'. Signaling processor to stop.")
+        debugger.log(f"WebSocket disconnected for user '{user_id}'. Signaling processor to stop.", user_id=user_id)
     finally:
         queue_manager.disconnect(user_id)
         if not processing_task.done():
@@ -555,8 +794,5 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             pass
         
 if __name__ == "__main__":
-
-    
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
-      
