@@ -4,6 +4,7 @@ uvicorn[standard]
 aiofiles
 PyYAML
 websockets
+python-multipart
 
 # ---- Autogen / Agents ----
 autogen
