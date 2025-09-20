@@ -1,25 +1,3 @@
-"""
-This module provides a FastAPI application for a RAG (Retrieval-Augmented Generation) chatbot.
-
-The application serves a web interface, manages WebSocket connections for real-time
-chat, and implements a RAG pipeline to answer user questions based on a knowledge
-base and chat history. It uses ChromaDB for vector storage and HuggingFace models
-for text embedding.
-
-Key components:
-- `QueueManager`: Manages WebSocket connections and per-user message queues.
-- `RAGSystem`: Handles the core RAG logic, including document ingestion, text chunking,
-  embedding, retrieval from ChromaDB, and response generation using an LLM.
-- `RAGAssistantAgent`: An Autogen agent that integrates with the `RAGSystem` to
-  process chat messages and generate responses.
-- FastAPI Endpoints:
-  - `/`: Serves the main HTML file.
-  - `/ingest`: Triggers the ingestion of documents into the knowledge base.
-  - `/metrics`: Provides performance metrics for the RAG pipeline.
-  - `/connections`: Returns the number of active WebSocket connections.
-  - `/ws/{user_id}`: The WebSocket endpoint for chat communication.
-"""
-
 import json
 import os
 import time
@@ -32,35 +10,25 @@ import asyncio
 from transformers import AutoTokenizer, AutoModel
 import torch
 from openai import OpenAI
-from typing import Any, List, Tuple, Dict
+from typing import Any, List, Tuple, Dict, Optional
 import yaml
+import uuid 
 
 import aiofiles
 from autogen import ConversableAgent
 from autogen_agentchat.messages import TextMessage
 from autogen_core import CancellationToken
-from fastapi import FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from collections import deque
 
-# NEW: Import the DebugLogger
 from debugLogger import DebugLogger
+from peerChatManager import PeerChatManager
 
-# OLD: Remove the manual OpenTelemetry setup. The DebugLogger handles this.
-# from opentelemetry import trace
-# from opentelemetry.sdk.trace import TracerProvider
-# from opentelemetry.sdk.trace.export import BatchSpanProcessor
-# from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-# trace.set_tracer_provider(TracerProvider())
-# tracer = trace.get_tracer(__name__)
-# otlp_exporter = OTLPSpanExporter(endpoint="http://localhost:4318/v1/traces")
-# trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(otlp_exporter))
-
-# NEW: Initialize the centralized debugger
 debugger = DebugLogger(service_name="rag-chatbot")
 
-# --- FASTAPI SETUP ---
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -71,96 +39,35 @@ app.add_middleware(
 )
 app.mount("/static", StaticFiles(directory="."), name="static")
 
-# Use environment variables for sensitive or frequently changed configs
 HISTORY_DIR = os.environ.get("HISTORY_DIR", "./history_files")
 os.makedirs(HISTORY_DIR, exist_ok=True)
 METRICS_PATH = "metrics.json"
 CHROMA_DB_PATH = os.environ.get("CHROMA_DB_PATH", "./chroma_db")
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "./tmp/chromadb")
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "./downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+chat_manager = PeerChatManager()
 
-# --- QUEUE AND CONNECTION MANAGEMENT ---
-class QueueManager:
-    """Manages WebSocket connections and per-user message queues."""
-    def __init__(self):
-        """Initializes the QueueManager with empty dictionaries for connections and queues."""
-        self.active_connections: Dict[str, WebSocket] = {}
-        self.message_queues: Dict[str, asyncio.Queue] = {}
+# --- UTILITY FUNCTIONS ---
 
-    async def connect(self, websocket: WebSocket, user_id: str):
-        """
-        Accepts a new WebSocket connection and initializes a message queue for the user.
+def create_text_message(content: str, source: str, **kwargs) -> dict:
+    """Creates a dictionary for a TextMessage with all required fields."""
+    message = {
+        "id": str(uuid.uuid4()),
+        "source": source,
+        "content": content,
+        "timestamp": time.time(),
+        "status": "sent",
+        **kwargs
+    }
+    return message
 
-        Args:
-            websocket (WebSocket): The new WebSocket connection.
-            user_id (str): A unique identifier for the user.
-        """
-        await websocket.accept()
-        self.active_connections[user_id] = websocket
-        self.message_queues[user_id] = asyncio.Queue()
-        debugger.log("Client connected", user_id=user_id, total_connections=len(self.active_connections))
+def safe_model_dump(obj) -> dict:
+    """Safely converts a Pydantic model to a JSON-serializable dictionary."""
+    return json.loads(json.dumps(obj, default=str))
 
-    def disconnect(self, user_id: str):
-        """
-        Disconnects a user by removing their WebSocket connection and message queue.
-
-        Args:
-            user_id (str): The unique identifier of the user to disconnect.
-        """
-        if user_id in self.active_connections:
-            # Signal the processor to shut down
-            if user_id in self.message_queues:
-                self.message_queues[user_id].put_nowait(None)
-                del self.message_queues[user_id]
-            del self.active_connections[user_id]
-        debugger.log("Client disconnected", user_id=user_id, total_connections=len(self.active_connections))
-
-    async def get_message(self, user_id: str):
-        """
-        Retrieves the next message from a user's queue.
-
-        Args:
-            user_id (str): The unique identifier for the user.
-
-        Returns:
-            Any: The message from the queue, or None if the queue doesn't exist.
-        """
-        if user_id in self.message_queues:
-            return await self.message_queues[user_id].get()
-        return None
-    
-    async def send_message(self, user_id: str, message: Any):
-        """
-        Sends a JSON message to a specific user's WebSocket.
-
-        Args:
-            user_id (str): The unique identifier for the user.
-            message (Any): The JSON-serializable message to send.
-        """
-        if user_id in self.active_connections:
-            await self.active_connections[user_id].send_json(message)
-
-    @property
-    def connection_count(self) -> int:
-        """
-        Returns the number of currently active WebSocket connections.
-        
-        Returns:
-            int: The number of active connections.
-        """
-        return len(self.active_connections)
-
-queue_manager = QueueManager()
-
-
-# --- UTILITY FUNCTIONS FOR METRICS ---
 async def _record_metrics(data: dict):
-    """
-    Safely appends a new metric entry to the metrics JSON file.
-
-    Args:
-        data (dict): A dictionary containing metric data to be recorded.
-    """
     if not os.path.exists(METRICS_PATH):
         async with aiofiles.open(METRICS_PATH, "w") as file:
             await file.write(json.dumps([]))
@@ -172,44 +79,14 @@ async def _record_metrics(data: dict):
         await file.seek(0)
         await file.truncate()
         await file.write(json.dumps(metrics_list, indent=2, default=str))
-        
 
 def load_llm_config(filepath: str) -> dict:
-    """
-    Loads and parses a YAML configuration file for LLMs.
-
-    Args:
-        filepath (str): The path to the YAML configuration file.
-
-    Returns:
-        dict: The loaded configuration as a dictionary.
-    """
     with open(filepath, 'r') as file:
         return yaml.safe_load(file) 
             
-
-# --- RAG PIPELINE CONFIGURATION ---
+# --- RAG SYSTEM CLASS ---
 class RAGSystem:
-    """
-    Manages the Retrieval-Augmented Generation pipeline.
-
-    This class handles document ingestion, text embedding, retrieval from a vector database,
-    and generating responses using a Large Language Model (LLM).
-    """
     def __init__(self, config_list: List[dict], prompt_file: str, collection_name: str, history_collection_name: str, upload_dir: str, doc_extension: str = "*.{txt,pdf}", model_name: str = "sentence-transformers/all-MiniLM-L6-v2", batch_size: int = 50):
-        """
-        Initializes the RAGSystem with configurations and database clients.
-
-        Args:
-            config_list (List[dict]): A list of LLM configurations.
-            prompt_file (str): The file path to the YAML file containing prompt templates.
-            collection_name (str): The name of the ChromaDB collection for the knowledge base.
-            history_collection_name (str): The name of the ChromaDB collection for chat history.
-            upload_dir (str): The directory where documents for ingestion are stored.
-            doc_extension (str): The file extension pattern for documents to ingest.
-            model_name (str): The name of the HuggingFace model for embedding.
-            batch_size (int): The batch size for processing documents.
-        """
         self.collection_name = collection_name
         self.history_collection_name = history_collection_name
         self.upload_dir = upload_dir
@@ -228,29 +105,35 @@ class RAGSystem:
             raise RuntimeError("Model loading failed.")
         
         self.chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+        self.collections = {} # New dictionary to hold peer-specific collections
+
         try:
             self.collection = self.chroma_client.get_collection(name=self.collection_name)
-            debugger.log(f"Collection '{self.collection_name}' found.", level="info")
+            debugger.log(f"Global collection '{self.collection_name}' found.", level="info")
         except Exception:
             self.collection = self.chroma_client.create_collection(name=self.collection_name)
-            debugger.log(f"Collection '{self.collection_name}' created.", level="info")
+            debugger.log(f"Global collection '{self.collection_name}' created.", level="info")
             
         try:
             self.history_collection = self.chroma_client.get_or_create_collection(name=self.history_collection_name)
             debugger.log(f"History collection '{self.history_collection_name}' found or created.", level="info")
         except Exception as e:
             debugger.log(f"Failed to get/create history collection: {e}", level="error")
-            
+
+    def get_peer_collection(self, user_id: str, peer_id: str):
+        # Create a unique, consistent name for the collection based on the two user IDs
+        sorted_ids = sorted([user_id, peer_id])
+        collection_name = hashlib.md5(f"{sorted_ids[0]}_{sorted_ids[1]}".encode('utf-8')).hexdigest()
+        if collection_name not in self.collections:
+            try:
+                self.collections[collection_name] = self.chroma_client.get_or_create_collection(name=collection_name)
+                debugger.log(f"Peer-to-peer collection for {user_id} and {peer_id} found or created.", level="info")
+            except Exception as e:
+                debugger.log(f"Failed to get/create peer collection: {e}", level="error")
+                return None
+        return self.collections[collection_name]
+    
     def _load_prompts(self, filepath: str) -> dict:
-        """
-        Loads and parses a YAML configuration file for prompts.
-        
-        Args:
-            filepath (str): The path to the YAML configuration file.
-        
-        Returns:
-            dict: The loaded configuration as a dictionary, or an empty dict on error.
-        """
         try:
             with open(filepath, 'r') as file:
                 return yaml.safe_load(file).get('prompts', {})
@@ -262,32 +145,12 @@ class RAGSystem:
             return {} 
             
     def embed_texts(self, texts: list[str]):
-        """
-        Generates embeddings for a list of text documents using the HuggingFace model.
-
-        Args:
-            texts (list[str]): A list of strings to embed.
-
-        Returns:
-            list: A list of embedding vectors.
-        """
         inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
         with torch.no_grad():
             embeddings = self.model(**inputs).last_hidden_state.mean(dim=1)
         return embeddings.numpy().tolist()
 
     def _chunk_text(self, text, chunk_size=600, overlap=120):
-        """
-        Splits a long text into smaller, overlapping chunks.
-
-        Args:
-            text (str): The text to be chunked.
-            chunk_size (int): The desired size of each chunk.
-            overlap (int): The number of characters to overlap between chunks.
-
-        Returns:
-            list[str]: A list of text chunks.
-        """
         chunks = []
         start = 0
         while start < len(text):
@@ -300,27 +163,9 @@ class RAGSystem:
         return [c.strip() for c in chunks if c.strip()]
 
     def _make_id(self, text):
-        """
-        Generates a unique ID for a text chunk using a hash function.
-
-        Args:
-            text (str): The text chunk to hash.
-
-        Returns:
-            str: The MD5 hash of the text.
-        """
         return hashlib.md5(text.encode("utf-8")).hexdigest()
 
     def _normalize_roman_numerals(self, text):
-        """
-        Converts Roman numerals in text to Arabic numerals.
-
-        Args:
-            text (str): The text to normalize.
-
-        Returns:
-            str: The text with Roman numerals converted.
-        """
         roman_to_arabic = {
             'I': '1', 'II': '2', 'III': '3', 'IV': '4', 'V': '5',
             'VI': '6', 'VII': '7', 'VIII': '8', 'IX': '9', 'X': '10',
@@ -329,7 +174,8 @@ class RAGSystem:
         for roman, arabic in roman_to_arabic.items():
             text = re.sub(r'\b' + re.escape(roman) + r'[\.\s]', arabic + '. ', text, flags=re.IGNORECASE)
         return text
-
+    
+    
     def ingest_docs(self) -> JSONResponse:
         """
         Ingests all documents from the upload directory into the ChromaDB collection.
@@ -402,52 +248,48 @@ class RAGSystem:
         message = f" Ingestion & indexing of {total_chunks} docs completed in {end-start:.2f} seconds."
         debugger.log(message, total_chunks=total_chunks, duration=end-start)
         return JSONResponse(status_code=status.HTTP_200_OK, content={"message": message})
+    
+    async def ingest_peer_doc(self, file_path: str, user_id: str, peer_id: str):
+        collection = self.get_peer_collection(user_id, peer_id)
+        if collection is None:
+            return False, "Failed to get peer collection."
 
-    def ingest_message(self, message: TextMessage, user_id: str):
-        """
-        Ingests a single chat message into the chat history collection with user metadata.
-
-        Args:
-            message (TextMessage): The message object to ingest.
-            user_id (str): The unique identifier of the user who sent the message.
-        """
-        if not message.content:
-            return
-        
-        message_id = str(hashlib.sha256(f"{user_id}_{message.content}".encode('utf-8')).hexdigest())
-        metadata = {
-            "source": message.source,
-            "timestamp": time.time(),
-            "user_id": user_id
-        }
-        
+        file_extension = os.path.splitext(file_path)[1].lower()
+        full_text = ""
         try:
-            self.history_collection.upsert(
-                documents=[message.content],
-                ids=[message_id],
-                metadatas=[metadata]
+            if file_extension == ".txt":
+                async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                    full_text = await f.read()
+            elif file_extension == ".pdf":
+                async with aiofiles.open(file_path, "rb") as f:
+                    doc = fitz.open(stream=await f.read(), filetype="pdf")
+                    for page in doc:
+                        full_text += page.get_text()
+                    doc.close()
+            else:
+                debugger.log(f" Skipping unsupported file type for ingestion: {file_extension}", level="warning")
+                return False, "Unsupported file type."
+
+            full_text = self._normalize_roman_numerals(full_text)
+            chunks = self._chunk_text(full_text)
+            
+            documents_to_add = [c for c in chunks]
+            ids_to_add = [self._make_id(c) for c in chunks]
+            metadatas_to_add = [{"source_file": os.path.basename(file_path), "sender_id": user_id, "receiver_id": peer_id} for _ in chunks]
+            
+            collection.upsert(
+                documents=documents_to_add,
+                ids=ids_to_add,
+                metadatas=metadatas_to_add
             )
-            debugger.log(f"Ingested message from '{message.source}' for user '{user_id}' into history collection.", source=message.source, user_id=user_id)
+            debugger.log(f"Upserted {len(documents_to_add)} documents for P2P chat.", user_id=user_id, peer_id=peer_id)
+            return True, f"Ingested {len(documents_to_add)} chunks from {os.path.basename(file_path)}."
+
         except Exception as e:
-            debugger.log(f"Failed to ingest message into history collection for user '{user_id}': {e}", level="error", user_id=user_id)
+            debugger.log(f"Failed to process document {file_path}: {e}", level="error", file_path=file_path)
+            return False, f"Failed to ingest document: {str(e)}"
 
-    def retrieve_and_answer(self, messages: List[TextMessage], user_id: str) -> Tuple[str, dict]:
-        """
-        Executes the full RAG pipeline for a given conversation.
-
-        The process includes:
-        1. Rephrasing the latest query into a standalone question using a LLM.
-        2. Retrieving relevant documents from the knowledge base and chat history.
-        3. Generating a final answer based on the retrieved context using a primary LLM.
-
-        Args:
-            messages (List[TextMessage]): The list of all messages in the current conversation.
-            user_id (str): The unique identifier of the user.
-
-        Returns:
-            Tuple[str, dict]: A tuple containing the generated answer and a dictionary
-                              of performance metrics.
-        """
+    def retrieve_and_answer(self, messages: List[TextMessage], user_id: str, peer_id: Optional[str] = None) -> Tuple[str, dict]:
         start_total = time.time()
         debugger.log(f"--- RAG pipeline executing for user '{user_id}' with conversation history. ---", user_id=user_id)
         
@@ -495,26 +337,49 @@ class RAGSystem:
             start_retrieval = time.time()
             query_emb = self.embed_texts([standalone_query])[0]
             
-            kb_results = self.collection.query(query_embeddings=[query_emb], n_results=5)
-            history_results = self.history_collection.query(
-                query_embeddings=[query_emb],
-                n_results=5,
-                where={"user_id": user_id}
-            )
+            context = ""
+            combined_docs = []
+            
+            if peer_id:
+                peer_collection = self.get_peer_collection(user_id, peer_id)
+                if peer_collection:
+                    peer_results = peer_collection.query(
+                        query_embeddings=[query_emb],
+                        n_results=5,
+                        where={"$or": [{"sender_id": user_id}, {"receiver_id": user_id}]}
+                    )
+                    combined_docs = peer_results.get("documents", [[]])[0]
+                    debugger.log("Using peer-specific knowledge base documents.", source="peer_docs")
+            else:
+                history_results = self.history_collection.query(
+                    query_embeddings=[query_emb],
+                    n_results=5,
+                    where={"user_id": user_id}
+                )
+                
+                history_docs = history_results.get("documents", [[]])[0]
+                history_distances = history_results.get("distances", [[]])[0]
+                RELEVANCE_THRESHOLD = 0.5 
+                
+                if history_docs and history_distances[0] < RELEVANCE_THRESHOLD:
+                    combined_docs = history_docs
+                    debugger.log("Relevant chat history found. Prioritizing history.", source="chat_history")
+                else:
+                    kb_results = self.collection.query(query_embeddings=[query_emb], n_results=5)
+                    kb_docs = kb_results.get("documents", [[]])[0]
+                    combined_docs = kb_docs
+                    debugger.log("No relevant history found. Using global knowledge base documents.", source="knowledge_base")
+
+            context = "\n".join(combined_docs)
             
             end_retrieval = time.time()
-            
-            kb_docs = kb_results.get("documents", [[]])[0]
-            history_docs = history_results.get("documents", [[]])[0]
-            combined_docs = kb_docs + history_docs
-            context = "\n".join(combined_docs)
             
             metrics["retrieval_latency"] = end_retrieval - start_retrieval
             metrics["retrieved_docs"] = len(combined_docs)
             
             if not context.strip():
                 metrics["total_latency"] = time.time() - start_total
-                return "Sorry, I could not find any relevant information on that topic in the knowledge base or your chat history.", metrics
+                return "Sorry, I could not find any relevant information on that topic.", metrics
             
             start_generation = time.time()
             primary_prompt_template = self.prompts.get("primary_prompt_v1", "Default primary prompt not found.")
@@ -546,60 +411,64 @@ class RAGSystem:
             debugger.log(f"An unexpected error occurred in the processor: {e}", level="error", error_message=error_message)
             metrics["total_latency"] = time.time() - start_total
             return "Sorry, an internal error occurred while processing your request.", metrics
+    
+    def ingest_messages_for_rag(self, messages: List[dict], user_id: str, peer_id: str):
+        documents_to_add = []
+        ids_to_add = []
+        metadatas_to_add = []
 
-# --- AGENT SETUP ---
+        for message in messages:
+            content = message.get('content')
+            source = message.get('source')
+            if not content:
+                continue
+            
+            message_id = message.get('id', str(uuid.uuid4()))
+            metadata = {
+                "source": source,
+                "timestamp": message.get('timestamp', time.time()),
+                "user_id": user_id,
+                "peer_user_id": peer_id,
+                "message_id": message_id
+            }
+
+            documents_to_add.append(content)
+            ids_to_add.append(message_id)
+            metadatas_to_add.append(metadata)
+
+        if documents_to_add:
+            try:
+                self.history_collection.upsert(
+                    documents=documents_to_add,
+                    ids=ids_to_add,
+                    metadatas=metadatas_to_add
+                )
+                debugger.log(f"Ingested {len(documents_to_add)} messages into history collection for conversation between '{user_id}' and '{peer_id}'.")
+            except Exception as e:
+                debugger.log(f"Failed to ingest messages into history collection for '{user_id}' and '{peer_id}': {e}", level="error")
+    
+# --- AGENT AND CHAT PROCESSORS ---
+
 class RAGAssistantAgent(ConversableAgent):
-    """
-    An Autogen ConversableAgent that uses the RAGSystem to respond to messages.
-    """
     def __init__(self, rag_system: RAGSystem, **kwargs):
-        """
-        Initializes the agent with a reference to the RAGSystem.
-
-        Args:
-            rag_system (RAGSystem): The RAG system instance to use for generating responses.
-            **kwargs: Additional arguments for the ConversableAgent base class.
-        """
         super().__init__(**kwargs)
         self.rag_system = rag_system
 
-    async def on_messages(self, messages: List[TextMessage], cancellation_token: CancellationToken, user_id: str) -> Tuple[TextMessage, dict]:
-        """
-        Handles incoming messages and generates a response using the RAG pipeline.
-
-        Args:
-            messages (List[TextMessage]): The list of messages in the conversation.
-            cancellation_token (CancellationToken): A token to check for cancellation.
-            user_id (str): The unique identifier of the user.
-
-        Returns:
-            Tuple[TextMessage, dict]: A tuple containing the generated response message
-                                      and the performance metrics.
-        """
-        rag_response, metrics = self.rag_system.retrieve_and_answer(messages, user_id)
+    async def on_messages(self, messages: List[TextMessage], cancellation_token: CancellationToken, user_id: str, peer_id: Optional[str] = None) -> Tuple[TextMessage, dict]:
+        rag_response, metrics = self.rag_system.retrieve_and_answer(messages, user_id, peer_id)
         return TextMessage(content=rag_response, source=self.name), metrics
 
 async def get_agent(history: list[dict[str, Any]], rag_system: RAGSystem) -> RAGAssistantAgent:
-    """
-    Creates and initializes a RAGAssistantAgent with the given history.
-
-    Args:
-        history (list[dict[str, Any]]): The conversation history to load into the agent.
-        rag_system (RAGSystem): The RAG system instance for the agent to use.
-
-    Returns:
-        RAGAssistantAgent: The initialized agent instance.
-    """
     agent = RAGAssistantAgent(
         name="assistant",
         system_message="You are a helpful assistant.",
         rag_system=rag_system
     )
-    agent._history = history
+    # Safely convert history dictionaries to TextMessage objects
+    agent._history = [TextMessage(**msg) for msg in history if 'source' in msg and 'content' in msg]
     return agent
 
-
-#  Initialize RAGSystem globally
+# --- CONFIGURATION AND INSTANTIATION (MOVED TO THE TOP) ---
 try:
     model_config = load_llm_config("model_config.yaml")
     config_list = model_config.get("config_list", [])
@@ -619,30 +488,35 @@ rag_system = RAGSystem(
     doc_extension="*.*",
     batch_size=100
 )
-# # Initialize RAGSystem globally
-# rag_system = RAGSystem(collection_name="generalized_collection", history_collection_name="chat_history_collection", upload_dir=UPLOAD_DIR, doc_extension="*.*", batch_size=100)
 
 # --- FASTAPI ENDPOINTS ---
+
 @app.get("/")
 async def root():
-    """Serves the main HTML page for the chatbot interface."""
     return FileResponse("app_agent.html")
 
 @app.post("/ingest")
 async def ingest_documents():
-    """Triggers the ingestion of documents into the RAG knowledge base."""
     return rag_system.ingest_docs()
 
+@app.get("/metrics")
+async def get_metrics():
+    try:
+        if not os.path.exists(METRICS_PATH):
+            return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "No metrics data available yet."})
+        async with aiofiles.open(METRICS_PATH, "r") as file:
+            contents = await file.read()
+            return json.loads(contents)
+    except FileNotFoundError:
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "No metrics data available yet."})
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An error occurred: {str(e)}")
+
+@app.get("/connections")
+async def get_current_connections():
+    return JSONResponse(content={"active_connections": chat_manager.connection_count})
+
 async def get_history_for_user(user_id: str) -> list[dict[str, Any]]:
-    """
-    Loads chat history from a user-specific file.
-
-    Args:
-        user_id (str): The unique identifier of the user.
-
-    Returns:
-        list[dict[str, Any]]: The loaded chat history as a list of dictionaries.
-    """
     history_file_path = os.path.join(HISTORY_DIR, f"agent_history_{user_id}.json")
     try:
         if not os.path.exists(history_file_path):
@@ -660,67 +534,28 @@ async def get_history_for_user(user_id: str) -> list[dict[str, Any]]:
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An error occurred while loading history: {str(e)}") from e
 
-@app.get("/metrics")
-async def get_metrics():
-    """
-    Returns the performance metrics for each chat response.
 
-    Returns:
-        JSONResponse: A JSON object containing the recorded metrics.
-    """
-    try:
-        if not os.path.exists(METRICS_PATH):
-            return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "No metrics data available yet."})
-        async with aiofiles.open(METRICS_PATH, "r") as file:
-            contents = await file.read()
-            return json.loads(contents)
-    except FileNotFoundError:
-        return JSONResponse(status_code=status.HTTP_200_OK, content={"message": "No metrics data available yet."})
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An error occurred: {str(e)}")
-
-@app.get("/connections")
-async def get_current_connections():
-    """
-    Returns the number of currently active WebSocket connections.
-
-    Returns:
-        JSONResponse: A JSON object with the active connection count.
-    """
-    return JSONResponse(content={"active_connections": queue_manager.connection_count})
-
-async def task_processor(user_id: str):
-    """
-    Background task to process messages from a user's queue.
-
-    This task continuously listens for new messages in the queue, processes them
-    using the RAG system, and sends the response back to the client.
-
-    Args:
-        user_id (str): The unique identifier of the user.
-    """
+async def model_chat_task_processor(user_id: str):
     history_list = await get_history_for_user(user_id)
     if not isinstance(history_list, list):
         history_list = []
     
-    # Send history to the client upon connection
-    await queue_manager.send_message(user_id, {"type": "history", "content": history_list})
+    await chat_manager.send_message(user_id, {"type": "history", "content": history_list})
 
     while True:
         try:
-            data = await queue_manager.get_message(user_id)
+            data = await chat_manager.get_message(user_id)
             if data is None:
-                # Disconnect signal received
                 break
             
-            # REPLACED: Old OpenTelemetry span and attribute calls
             with debugger.start_span("chat_message"):
-                debugger.log("Received message", user_id=user_id, user_input=data)
+                # Use json.dumps() to convert the dictionary to a string for logging
+                debugger.log("Received message", user_id=user_id, user_input=json.dumps(data))
 
-                request_data = json.loads(data)
-                request = TextMessage(**request_data)
+                # The incoming data is a dictionary, no need for json.loads()
+                request = TextMessage(**data)
 
-                rag_system.ingest_message(request, user_id)
+                rag_system.ingest_messages_for_rag(messages=[request.model_dump()], user_id=user_id, peer_id="model")
                 history_list.append(request.model_dump())
                 
                 agent = await get_agent(history=history_list, rag_system=rag_system)
@@ -733,13 +568,8 @@ async def task_processor(user_id: str):
 
                 debugger.log("Assistant response", response_content=response.content)
             
-            def safe_model_dump(obj):
-                return json.loads(json.dumps(obj, default=str))
-            
-            rag_system.ingest_message(response, user_id)
+            rag_system.ingest_messages_for_rag(messages=[response.model_dump()], user_id=user_id, peer_id="model")
             history_list.append(response.model_dump())
-            
-            # await _record_metrics(metrics)
             
             history_file_path = os.path.join(HISTORY_DIR, f"agent_history_{user_id}.json")
             async with aiofiles.open(history_file_path, "w") as file:
@@ -747,7 +577,7 @@ async def task_processor(user_id: str):
                 
             assert isinstance(response, TextMessage)
             
-            await queue_manager.send_message(user_id, safe_model_dump(response.model_dump()))
+            await chat_manager.send_message(user_id, safe_model_dump(response.model_dump()))
 
         except Exception as e:
             debugger.log(f"An unexpected error occurred in the processor for user '{user_id}': {e}", level="error", user_id=user_id)
@@ -756,42 +586,259 @@ async def task_processor(user_id: str):
                 "content": "An internal server error occurred.",
                 "source": "system"
             }
-            await queue_manager.send_message(user_id, error_message)
-            # Break the loop to stop processing for this user
+            await chat_manager.send_message(user_id, error_message)
             break
 
+async def peer_chat_task_processor(user_id: str, peer_id: str):
+    try:
+        history = await chat_manager.load_history_from_cache(user_id, peer_id)
+        await chat_manager.send_message(user_id, {"type": "history", "content": history})
+        
+        while True:
+            message_data = await chat_manager.get_message(user_id)
+            if message_data is None:
+                break
+            
+            # Handle document messages specifically
+            if message_data.get("type") == "document_shared":
+                filename = message_data.get("filename")
+                file_url = message_data.get("file_url")
+                # Create a file message to be broadcast to the peer
+                file_message = {
+                    "type": "document_shared",
+                    "filename": filename,
+                    "file_url": file_url,
+                    "source": user_id,
+                    "timestamp": time.time()
+                }
+                
+                # Ingest the file path and metadata into the RAG system
+                rag_system.ingest_peer_doc(os.path.join(UPLOAD_DIR, filename), user_id, peer_id)
+                
+                await chat_manager.add_message_to_history(user_id, peer_id, file_message)
+                
+                if chat_manager.is_connected(peer_id):
+                    # Broadcast the file message to the peer
+                    await chat_manager.send_message_to_peer(peer_id, file_message)
+                continue
 
-@app.websocket("/ws/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: str):
-    """
-    Manages the WebSocket connection for a specific user.
+            # Existing logic for text messages
+            message = create_text_message(
+                content=message_data["content"],
+                source=user_id,
+                to=peer_id
+            )
 
-    Args:
-        websocket (WebSocket): The WebSocket connection object.
-        user_id (str): The unique identifier for the user.
-    """
-    await queue_manager.connect(websocket, user_id)
-    debugger.log(f"WebSocket connected for user: {user_id}", user_id=user_id)
+            await chat_manager.add_message_to_history(user_id, peer_id, message)
+
+            if chat_manager.is_connected(peer_id):
+                await chat_manager.send_message_to_peer(peer_id, {
+                    "type": "chat",
+                    "message_id": message["id"],
+                    "source": message["source"],
+                    "content": message["content"],
+                    "timestamp": message["timestamp"],
+                    "requires_ack": True
+                })
+
+            rag_system.ingest_messages_for_rag(messages=[message], user_id=user_id, peer_id=peer_id)
+    except Exception as e:
+        debugger.log(f"Error in peer chat processor for {user_id}: {e}", level="error")
+        try:
+            await chat_manager.send_message(user_id, {
+                "type": "error",
+                "content": "An internal server error occurred.",
+                "source": "system"
+            })
+        except Exception:
+            pass
+        finally:
+            chat_manager.disconnect(user_id)
+
+async def rag_peer_chat_processor(user_id: str, peer_id: str):
+    try:
+        while True:
+            message_data = await chat_manager.get_message(user_id)
+            if message_data is None:
+                break
+            
+            user_message = create_text_message(
+                content=message_data["content"],
+                source=user_id,
+                to=peer_id
+            )
+            
+            await chat_manager.add_message_to_history(user_id, peer_id, user_message)
+            
+            history_list = await chat_manager.load_history_from_cache(user_id, peer_id)
+            print(history_list)
+            
+            rag_system.ingest_messages_for_rag(messages=history_list, user_id=user_id, peer_id=peer_id)
+            
+            messages_for_agent = [TextMessage(**msg) for msg in history_list if 'source' in msg and 'content' in msg]
+            
+            agent = await get_agent(history=messages_for_agent, rag_system=rag_system)
+            response, _ = await agent.on_messages(
+                messages=messages_for_agent, 
+                cancellation_token=CancellationToken(),
+                user_id=user_id,
+                peer_id=peer_id # Pass peer_id here
+            )
+            
+            rag_message = create_text_message(
+                content=response.content,
+                source="assistant",
+                to=user_id
+            )
+
+            await chat_manager.add_message_to_history(user_id, peer_id, rag_message)
+            
+            await chat_manager.send_message(user_id, {
+                "type": "chat",
+                "source": "assistant",
+                "content": rag_message["content"]
+            })
+                
+    except Exception as e:
+        debugger.log(f"Error in RAG peer chat processor for {user_id}: {e}", level="error")
+        await chat_manager.send_message(user_id, {"type": "error", "content": "An internal server error occurred in RAG processor.", "source": "system"})
+    finally:
+        chat_manager.disconnect(user_id)
+
+@app.websocket("/ws/model/{user_id}")
+async def websocket_model_chat_endpoint(websocket: WebSocket, user_id: str):
+    await chat_manager.connect(websocket, user_id)
+    await websocket.accept() 
     
-    # Start the background task to process messages from the queue
-    processing_task = asyncio.create_task(task_processor(user_id))
+    debugger.log(f"WebSocket connected for model chat user: {user_id}", user_id=user_id)
+    
+    async def websocket_listener():
+        try:
+            while True:
+                data = await websocket.receive_text()
+                if data is not None:
+                    message_data = json.loads(data)
+                    message = create_text_message(
+                        content=message_data.get('content', ''),
+                        source=message_data.get('source', user_id),
+                        status=message_data.get('status', 'sent')
+                    )
+                    await chat_manager.message_queues[user_id].put(message)
+        except WebSocketDisconnect:
+            debugger.log(f"WebSocket listener disconnected for model chat user '{user_id}'.", user_id=user_id)
+        except Exception as e:
+            debugger.log(f"Error in WebSocket listener for user '{user_id}': {e}", level="error")
+        finally:
+            await chat_manager.message_queues[user_id].put(None)
+    
+    listener_task = asyncio.create_task(websocket_listener())
+    processing_task = asyncio.create_task(model_chat_task_processor(user_id))
     
     try:
-        # Loop to receive messages and place them in the queue
-        while True:
-            data = await websocket.receive_text()
-            if data is not None:
-                await queue_manager.message_queues[user_id].put(data)
-    except WebSocketDisconnect:
-        debugger.log(f"WebSocket disconnected for user '{user_id}'. Signaling processor to stop.", user_id=user_id)
+        await asyncio.gather(listener_task, processing_task)
+    except asyncio.CancelledError:
+        debugger.log(f"Tasks for model user '{user_id}' were cancelled.", user_id=user_id)
+    except Exception as e:
+        debugger.log(f"An unexpected error occurred in model endpoint for user '{user_id}': {e}", level="error")
     finally:
-        queue_manager.disconnect(user_id)
+        debugger.log(f"Cleaning up tasks for model user '{user_id}'.", user_id=user_id)
+        if 'listener_task' in locals() and not listener_task.done():
+            listener_task.cancel()
         if not processing_task.done():
             processing_task.cancel()
+        chat_manager.disconnect(user_id)
+
+@app.post("/upload_doc/{user_id}/{peer_id}")
+async def upload_document(user_id: str, peer_id: str, file: UploadFile = File(...)):
+    """Uploads a document and adds it to the peer-to-peer RAG index."""
+    try:
+        file_path = os.path.join(UPLOAD_DIR, file.filename)
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        
+        async with aiofiles.open(file_path, 'wb') as f:
+            while chunk := await file.read(8192):
+                await f.write(chunk)
+        
+        success, message = await rag_system.ingest_peer_doc(file_path, user_id, peer_id)
+        
+        if success:
+            # Send a WebSocket message to both peers to notify them of the new document
+            notification = {
+                "type": "document_shared",
+                "filename": file.filename,
+                "file_url": f"/download_doc/{file.filename}",
+                "source": user_id,
+                "content": f"A new document '{file.filename}' has been shared and is ready for RAG."
+            }
+            await chat_manager.add_message_to_history(user_id,peer_id,message=notification)
+            
+            await chat_manager.send_message(user_id, notification)
+            if chat_manager.is_connected(peer_id):
+                await chat_manager.send_message_to_peer(peer_id, notification)
+            
+            return JSONResponse(status_code=status.HTTP_200_OK, content={"message": message})
+        else:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=message)
+        
+    except Exception as e:
+        debugger.log(f"Error during document upload: {e}", level="error")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"An error occurred during document upload: {str(e)}")
+
+@app.get("/download_doc/{filename}")
+async def download_document(filename: str):
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(path=file_path, filename=filename, media_type='application/octet-stream')
+
+@app.websocket("/ws/{user_id}/{peer_id}")
+async def websocket_peer_chat_endpoint(websocket: WebSocket, user_id: str, peer_id: str):
+    await chat_manager.connect(websocket, user_id)
+    await websocket.accept() 
+        
+    debugger.log(f"WebSocket connected for user: {user_id} in a chat with peer: {peer_id}", user_id=user_id, peer_id=peer_id)
+    
+    async def websocket_listener():
         try:
-            await processing_task
-        except asyncio.CancelledError:
-            pass
+            while True:
+                data = await websocket.receive_text()
+                if data is not None:
+                    message_data = json.loads(data)
+                    message = create_text_message(
+                        content=message_data.get('content', ''),
+                        source=message_data.get('source', user_id),
+                        to=peer_id
+                    )
+                    await chat_manager.message_queues[user_id].put(message)
+        except WebSocketDisconnect:
+            debugger.log(f"WebSocket listener disconnected for user '{user_id}'.", user_id=user_id)
+        except Exception as e:
+            debugger.log(f"Error in WebSocket listener for user '{user_id}': {e}", level="error")
+        finally:
+            await chat_manager.message_queues[user_id].put(None)
+    
+    listener_task = asyncio.create_task(websocket_listener())
+    
+    # Check if peer is online, if not, activate RAG mode
+    # if chat_manager.is_connected(peer_id):
+    debugger.log(f"Peer '{peer_id}' is online. Starting normal chat processor.", user_id=user_id)
+    processing_task = asyncio.create_task(peer_chat_task_processor(user_id, peer_id))
+    # else:
+    #     debugger.log(f"Peer '{peer_id}' is offline. Starting RAG chat processor.", user_id=user_id)
+    #     processing_task = asyncio.create_task(rag_peer_chat_processor(user_id, peer_id))
+    
+    try:
+        await asyncio.gather(listener_task, processing_task)
+    except asyncio.CancelledError:
+        debugger.log(f"Tasks for user '{user_id}' were cancelled.", user_id=user_id)
+    except Exception as e:
+        debugger.log(f"An unexpected error occurred in endpoint for user '{user_id}': {e}", level="error")
+    finally:
+        debugger.log(f"Cleaning up tasks for user '{user_id}'.", user_id=user_id)
+        listener_task.cancel()
+        processing_task.cancel()
+        chat_manager.disconnect(user_id)
         
 if __name__ == "__main__":
     import uvicorn
