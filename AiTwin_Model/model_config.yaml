@@ -4,7 +4,7 @@ config_list:
     base_url: "http://127.0.0.1:11433/v1"
     provider: "autogen_ext.models.openai.OpenAIChatCompletionClient"
     type: "primary_response"
-    temperature: 0
+    temperature: 0.3
     max_tokens: 150
 
   - model: "mistralai/mistral-7b-instruct-v0.3"
@@ -12,5 +12,5 @@ config_list:
     base_url: "http://127.0.0.1:11433/v1"
     provider: "autogen_ext.models.openai.OpenAIChatCompletionClient"
     type: "rephrase_response"
-    temperature: 0
+    temperature: 0.1
     max_tokens: 150
