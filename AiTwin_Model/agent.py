@@ -300,11 +300,14 @@ class RAGSystem:
         debugger.log(f"--- RAG pipeline executing for user '{user_id}' with conversation history. ---", user_id=user_id)
 
         latest_query = messages[-1].content
-
-        if latest_query.lower().strip() in ["hi", "hello", "hey"]:
-            return "Hello! I am a helpful RAG chatbot. How can I assist you today?", {}
-
-        history = "\n".join([f"{msg.source}: {msg.content}" for msg in messages])
+        # Get the latest K messages for immediate context
+        # K = 5 is a common setting for short-term memory
+        K_RECENT = 5
+        recent_messages = messages[-K_RECENT:]
+        
+        # Format the full history for the rephrase prompt and the recent history for the primary prompt context
+        full_history_text = "\n".join([f"{msg.source}: {msg.content}" for msg in messages])
+        recent_history_context_texts = [f"{msg.source}: {msg.content}" for msg in recent_messages]
 
         metrics = {
             "rephrase_latency": 0,
@@ -322,10 +325,11 @@ class RAGSystem:
                 api_key=self.rephrase_llm_config["api_key"]
             )
 
+            # --- 1. Rephrase the query ---
             start_rephrase = time.time()
             rephrase_prompt_template = self.prompts.get("rephrase_prompt_v1", "Default rephrase prompt not found.")
             rephrase_prompt = rephrase_prompt_template.format(
-                history=history,
+                history=full_history_text,
                 latest_query=latest_query
             )
             rephrased_response = client.chat.completions.create(
@@ -340,58 +344,86 @@ class RAGSystem:
             metrics["rephrase_tokens"] = rephrased_response.usage.total_tokens
             debugger.log(f"Rephrased standalone query: '{standalone_query}'", standalone_query=standalone_query)
 
+            # --- 2. Retrieve Context (Semantic Similarity + Recent History) ---
             start_retrieval = time.time()
             query_emb = self.embed_texts([standalone_query])[0]
-
-            context = ""
-            combined_docs = []
-
-            if peer_id:
+            
+            N_SIMILAR = 3 # Number of semantically similar documents to retrieve
+            
+            # Documents for the final prompt context
+            context_documents = [] 
+            
+            # --- Retrieval from Peer/KB/History ---
+            if peer_id and peer_id != "model":
+                # Peer-to-peer chat with RAG mode (using peer-specific document collection)
                 peer_collection = self.get_peer_collection(user_id, peer_id)
                 if peer_collection:
+                    # Query peer-specific document collection for relevant external docs
                     peer_results = peer_collection.query(
                         query_embeddings=[query_emb],
-                        n_results=5,
+                        n_results=N_SIMILAR,
                         where={"$or": [{"sender_id": user_id}, {"receiver_id": user_id}]}
                     )
-                    combined_docs = peer_results.get("documents", [[]])[0]
-                    debugger.log("Using peer-specific knowledge base documents.", source="peer_docs")
-            else:
+                    context_documents.extend(peer_results.get("documents", [[]])[0])
+                    debugger.log("Retrieved documents from peer-specific knowledge base.", source="peer_docs")
+                    
+            elif peer_id == "model":
+                # Chat with the RAG Model (user_id and peer_id="model")
+                # Retrieve semantically similar chat history from the user's conversation with the model
                 history_results = self.history_collection.query(
                     query_embeddings=[query_emb],
-                    n_results=5,
-                    where={"user_id": user_id}
-                )
-
-                history_docs = history_results.get("documents", [[]])[0]
-                history_distances = history_results.get("distances", [[]])[0]
-                RELEVANCE_THRESHOLD = 0.5
-
-                if history_docs and history_distances[0] < RELEVANCE_THRESHOLD:
-                    combined_docs = history_docs
-                    debugger.log("Relevant chat history found. Prioritizing history.", source="chat_history")
-                else:
-                    kb_results = self.collection.query(query_embeddings=[query_emb], n_results=5)
-                    kb_docs = kb_results.get("documents", [[]])[0]
-                    combined_docs = kb_docs
-                    debugger.log("No relevant history found. Using global knowledge base documents.", source="knowledge_base")
-
-            context = "\n".join(combined_docs)
+                    n_results=N_SIMILAR,
+                    # FIX: Explicitly wrap multiple conditions in '$and'
+                    where={"$and": [
+                    {"user_id": user_id},
+                    {"peer_user_id": "model"}
+        ]})
+                
+                similar_history_docs = history_results.get("documents", [[]])[0]
+                
+                # Filter out history messages that are already in the recent_history_context_texts to avoid duplication
+                # A simple filter: if a similar doc's content is the same as any recent message's content
+                similar_history_docs_filtered = []
+                recent_contents = [msg.content for msg in recent_messages]
+                for doc in similar_history_docs:
+                    if doc not in recent_contents:
+                        similar_history_docs_filtered.append(f"PAST CHAT: {doc}")
+                
+                context_documents.extend(similar_history_docs_filtered)
+                
+                debugger.log(f"Retrieved {len(similar_history_docs_filtered)} semantically similar chat history documents.", source="chat_history")
+                
+                # Fallback: If not enough context, also query the global KB
+                if len(context_documents) < N_SIMILAR:
+                    kb_results = self.collection.query(query_embeddings=[query_emb], n_results=N_SIMILAR)
+                    context_documents.extend(kb_results.get("documents", [[]])[0])
+                    debugger.log("Augmented context with global knowledge base documents.", source="knowledge_base")
+            
+            # --- Combine Contexts ---
+            # 1. Start with recent chat history
+            final_context_texts = recent_history_context_texts
+            
+            # 2. Add semantically retrieved documents/history
+            final_context_texts.extend(context_documents)
+            
+            # Join all context pieces for the LLM prompt
+            context = "\n".join(final_context_texts)
 
             end_retrieval = time.time()
 
             metrics["retrieval_latency"] = end_retrieval - start_retrieval
-            metrics["retrieved_docs"] = len(combined_docs)
+            metrics["retrieved_docs"] = len(context_documents) # Count only the RAG-retrieved docs
 
             if not context.strip():
                 metrics["total_latency"] = time.time() - start_total
                 return "Sorry, I could not find any relevant information on that topic.", metrics
 
+            # --- 3. Generate Answer ---
             start_generation = time.time()
-            primary_prompt_template = self.prompts.get("primary_prompt_v1", "Default primary prompt not found.")
+            primary_prompt_template = self.prompts.get("primary_prompt_v2", "Default primary prompt not found.")
             prompt = primary_prompt_template.format(
                 context=context,
-                history=history,
+                history=full_history_text, # Pass full history for conversational tone
                 latest_query=latest_query
             )
 
@@ -575,7 +607,8 @@ async def model_chat_task_processor(user_id: str):
                 response, metrics = await agent.on_messages(
                     messages=messages_for_agent,
                     cancellation_token=CancellationToken(),
-                    user_id=user_id
+                    user_id=user_id,
+                    peer_id="model" # Pass peer_id="model"
                 )
 
                 debugger.log("Assistant response", response_content=response.content)
@@ -677,29 +710,44 @@ async def peer_chat_task_processor(user_id: str, peer_id: str):
             chat_manager.disconnect(user_id)
 
 async def rag_peer_chat_processor(user_id: str, peer_id: str):
+    
+            # FIX START: Load and send history immediately upon connection to User 1
+    history_list = await chat_manager.load_history_from_cache(user_id, peer_id)
+    if not isinstance(history_list, list):
+        history_list = []
+            
+    await chat_manager.send_message(user_id, {"type": "history", "content": history_list})
+    debugger.log(f"Initial history loaded and sent for RAG user '{user_id}'.")
     try:
         while True:
             message_data = await chat_manager.get_message(user_id)
             if message_data is None:
                 break
 
+            # ... (user_message creation and persistence to DB) ...
             user_message = create_text_message(
                 content=message_data["content"],
                 source=user_id,
                 to=peer_id
             )
-
-            # CHANGE: Persist user message to DB
             await chat_manager.add_message_to_history(user_id, peer_id, user_message)
 
-            # CHANGE: Load full history from DB (guaranteed to include embedding_id)
             history_list = await chat_manager.load_history_from_cache(user_id, peer_id)
             print(history_list)
 
-            # Ingest history to ChromaDB (using DB-persisted messages)
             rag_system.ingest_messages_for_rag(messages=history_list, user_id=user_id, peer_id=peer_id)
 
-            messages_for_agent = [TextMessage(**msg) for msg in history_list if 'source' in msg and 'content' in msg]
+            # FIX: Explicitly add 'type': 'TextMessage' to each message dict before Pydantic parsing
+            messages_for_agent = []
+            for msg in history_list:
+                if 'source' in msg and 'content' in msg:
+                    # Create a copy and insert the required 'type' field
+                    msg_with_type = msg.copy()
+                    msg_with_type['type'] = 'TextMessage'
+                    messages_for_agent.append(TextMessage(**msg_with_type))
+            
+            # --- OLD LINE THAT WAS FAILING ---
+            # messages_for_agent = [TextMessage(**msg) for msg in history_list if 'source' in msg and 'content' in msg]
 
             agent = await get_agent(history=messages_for_agent, rag_system=rag_system)
             response, _ = await agent.on_messages(
@@ -708,14 +756,13 @@ async def rag_peer_chat_processor(user_id: str, peer_id: str):
                 user_id=user_id,
                 peer_id=peer_id # Pass peer_id here
             )
-
+            
+            # ... (rag_message creation, persistence, and sending) ...
             rag_message = create_text_message(
                 content=response.content,
                 source="assistant",
                 to=user_id
             )
-
-            # CHANGE: Persist RAG response to DB
             await chat_manager.add_message_to_history(user_id, peer_id, rag_message)
 
             await chat_manager.send_message(user_id, {
@@ -845,14 +892,17 @@ async def websocket_peer_chat_endpoint(websocket: WebSocket, user_id: str, peer_
             await chat_manager.message_queues[user_id].put(None)
 
     listener_task = asyncio.create_task(websocket_listener())
+    
+    # debugger.log(f"Peer '{peer_id}' is online. Starting normal chat processor.", user_id=user_id)
+    # processing_task = asyncio.create_task(peer_chat_task_processor(user_id, peer_id))
 
     # Check if peer is online, if not, activate RAG mode
-    # if chat_manager.is_connected(peer_id):
-    debugger.log(f"Peer '{peer_id}' is online. Starting normal chat processor.", user_id=user_id)
-    processing_task = asyncio.create_task(peer_chat_task_processor(user_id, peer_id))
-    # else:
-    #     debugger.log(f"Peer '{peer_id}' is offline. Starting RAG chat processor.", user_id=user_id)
-    #     processing_task = asyncio.create_task(rag_peer_chat_processor(user_id, peer_id))
+    if chat_manager.is_connected(peer_id):
+      debugger.log(f"Peer '{peer_id}' is online. Starting normal chat processor.", user_id=user_id)
+      processing_task = asyncio.create_task(peer_chat_task_processor(user_id, peer_id))
+    else:
+        debugger.log(f"Peer '{peer_id}' is offline. Starting RAG chat processor.", user_id=user_id)
+        processing_task = asyncio.create_task(rag_peer_chat_processor(user_id, peer_id))
 
     try:
         await asyncio.gather(listener_task, processing_task)
