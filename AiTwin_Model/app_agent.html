@@ -307,12 +307,26 @@
                     const data = JSON.parse(event.data);
                     if (data.type === 'history') {
                         data.content.forEach(message => {
-                            let source = 'user';
+                            let source;
                             if (chatMode === 'p2p') {
-                                source = (message.source && message.source !== userId) ? 'peer' : 'user';
-                            } else if (chatMode === 'model') {
-                                source = (message.source === 'assistant') ? 'assistant' : 'user';
+                                if (message.source === userId) {
+                                    // My messages (logged-in user)
+                                    source = 'user';
+                                }else if (message.source === "assistant") {
+                                    source = "assistant";
+                                }
+ 
+                                else {
+
+                                    source = 'peer';
+                                }
                             }
+                            else if (chatMode === 'model') {
+                                source = (message.source === 'assistant') ? 'assistant' : 'user';
+                            } else {
+                                source = 'user';
+                            }
+
                             if (message.type === 'document_shared') {
                                 displayFileMessage(message);
                             } else {
