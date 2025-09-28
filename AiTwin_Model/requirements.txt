@@ -5,6 +5,8 @@ aiofiles
 PyYAML
 websockets
 python-multipart
+faiss-cpu
+tiktoken
 
 # ---- Autogen / Agents ----
 autogen
