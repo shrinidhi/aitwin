@@ -148,7 +148,7 @@ class RAGSystem:
     def _load_prompts(self, filepath: str) -> dict:
         try:
             with open(filepath, 'r') as file:
-                return yaml.safe_load(file).get('prompts', {})
+                return yaml.safe_load(file).get('config/prompts', {})
         except FileNotFoundError:
             debugger.log(f"Warning: Prompt file '{filepath}' not found. Using default prompts.", level="warning")
             return {}
@@ -417,10 +417,13 @@ class RAGSystem:
             if not context.strip():
                 metrics["total_latency"] = time.time() - start_total
                 return "Sorry, I could not find any relevant information on that topic.", metrics
+            
+            
+
 
             # --- 3. Generate Answer ---
             start_generation = time.time()
-            primary_prompt_template = self.prompts.get("primary_prompt_v2", "Default primary prompt not found.")
+            primary_prompt_template = self.prompts.get("primary_prompt_v1","Default rephrase prompt not found.")
             prompt = primary_prompt_template.format(
                 context=context,
                 history=full_history_text, # Pass full history for conversational tone
@@ -893,16 +896,16 @@ async def websocket_peer_chat_endpoint(websocket: WebSocket, user_id: str, peer_
 
     listener_task = asyncio.create_task(websocket_listener())
     
-    # debugger.log(f"Peer '{peer_id}' is online. Starting normal chat processor.", user_id=user_id)
-    # processing_task = asyncio.create_task(peer_chat_task_processor(user_id, peer_id))
+    debugger.log(f"Peer '{peer_id}' is online. Starting normal chat processor.", user_id=user_id)
+    processing_task = asyncio.create_task(peer_chat_task_processor(user_id, peer_id))
 
     # Check if peer is online, if not, activate RAG mode
-    if chat_manager.is_connected(peer_id):
-      debugger.log(f"Peer '{peer_id}' is online. Starting normal chat processor.", user_id=user_id)
-      processing_task = asyncio.create_task(peer_chat_task_processor(user_id, peer_id))
-    else:
-        debugger.log(f"Peer '{peer_id}' is offline. Starting RAG chat processor.", user_id=user_id)
-        processing_task = asyncio.create_task(rag_peer_chat_processor(user_id, peer_id))
+    # if chat_manager.is_connected(peer_id):
+    #   debugger.log(f"Peer '{peer_id}' is online. Starting normal chat processor.", user_id=user_id)
+    #   processing_task = asyncio.create_task(peer_chat_task_processor(user_id, peer_id))
+    # else:
+    #     debugger.log(f"Peer '{peer_id}' is offline. Starting RAG chat processor.", user_id=user_id)
+    #     processing_task = asyncio.create_task(rag_peer_chat_processor(user_id, peer_id))
 
     try:
         await asyncio.gather(listener_task, processing_task)
