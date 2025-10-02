@@ -14,7 +14,8 @@ autogen-agentchat
 autogen-agentchat[websockets]>=0.2
 autogen-ext[openai]
 openai
-motor[loop] pymongo[srv]
+motor[loop] 
+pymongo[srv]
 
 # ---- Chroma / Embeddings ----
 chromadb==1.0.16
