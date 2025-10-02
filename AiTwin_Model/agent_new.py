@@ -699,7 +699,7 @@ async def peer_chat_task_processor(user_id: str, peer_id: str):
         await chat_manager.send_message(user_id, {"type": "history", "content": history})
 
         while True:
-            # ⭐ FIX 1: Peer Offline Check - Allows switching from Live Chat to RAG Proxy
+            # FIX 1: Peer Offline Check - Allows switching from Live Chat to RAG Proxy
             if not chat_manager.is_connected(peer_id):
                 debugger.log(f"Peer '{peer_id}' went offline. Terminating live chat task for switching to RAG proxy.", user_id=user_id)
                 await chat_manager.send_message(user_id, {"type": "status_update", "content": "Peer went offline. AI proxy mode started.", "peer_online": False})
@@ -799,7 +799,7 @@ async def rag_peer_chat_processor(user_id: str, peer_id: str):
                 # User disconnected (listener put None in the queue)
               break
                     
-            # ⭐ FIX 2 APPLIED HERE: The message is already in 'message_data'
+            # FIX 2 APPLIED HERE: The message is already in 'message_data'
             
             # The message is sent by the active user (user_id)
             user_message = create_text_message(
